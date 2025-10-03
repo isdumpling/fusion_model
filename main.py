@@ -84,12 +84,13 @@ def parse_args():
     
     # --- 快捷配置参数 ---
     parser.add_argument('--ablation_config', type=str, default=None,
-                        choices=['combo1', 'combo2', 'combo3', 'combo4'],
+                        choices=['combo1', 'combo2', 'combo3', 'combo4', 'combo5'],
                         help='Predefined ablation experiment configurations: '
                              'combo1: Focal Loss + Logit Adj (no sampler), '
                              'combo2: Only Logit Adj (no focal, no sampler), '
                              'combo3: Sampler + Focal (no logit adj), '
-                             'combo4: All enabled')
+                             'combo4: Only Sampler, '
+                             'combo5: ALl Enabled')
 
     args = parser.parse_args()
     
@@ -119,11 +120,14 @@ def parse_args():
             print("Ablation Config 3: WeightedSampler + Focal Loss (No Logit Adjustment)")
             
         elif args.ablation_config == 'combo4':
+            print("Ablation config 4: Only WeightedSampler")
+
+        elif args.ablation_config == 'combo5':
             # 组合四：全部启用
             args.use_weighted_sampler = True
             args.use_focal_loss = True
             args.use_logit_adjustment = True
-            print("Ablation Config 4: All Methods Enabled")
+            print("Ablation Config 5: All Methods Enabled")
 
     # --- 自动设置输出路径 ---
     now = datetime.now()
