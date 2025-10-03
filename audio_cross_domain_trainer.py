@@ -13,7 +13,7 @@ from sklearn.metrics import f1_score
 
 from datasets.dataloader import get_cross_domain_audio_dataset
 from audio_distill_los_system import AudioDistillLOSSystem
-from utils.common import hms_string
+from utils.common import hms_string, calculate_flops
 from utils.logger import logger
 from tqdm import tqdm
 
@@ -47,6 +47,9 @@ class CrossDomainAudioTrainer:
         
         # 初始化模型 - 传入类别样本数以支持Logit Adjustment
         self.model = AudioDistillLOSSystem(args, class_counts=self.N_SAMPLES_PER_CLASS).cuda()
+        
+        # 计算并记录模型FLOPs和参数量（在独立的随机状态下）
+        self._compute_and_log_flops()
         
     def setup_data(self):
         """设置数据加载器"""
@@ -123,6 +126,61 @@ class CrossDomainAudioTrainer:
             sampler=sampler
         )
     
+    def _compute_and_log_flops(self):
+        """计算并记录模型的FLOPs和参数量"""
+        import random
+        
+        print("\n" + "="*60)
+        print("计算模型复杂度...")
+        print("="*60)
+        
+        # 保存当前所有的随机状态
+        torch_rng_state = torch.get_rng_state()
+        numpy_rng_state = np.random.get_state()
+        python_rng_state = random.getstate()
+        if torch.cuda.is_available():
+            cuda_rng_state = torch.cuda.get_rng_state()
+        
+        try:
+            # 创建一个全新的模型实例用于计算FLOPs
+            from audio_distill_los_system import AudioDistillLOSSystem
+            temp_model = AudioDistillLOSSystem(self.args, class_counts=self.N_SAMPLES_PER_CLASS).cuda()
+            temp_model.eval()
+            
+            # 计算FLOPs（使用标准输入尺寸: batch=1, channels=1, n_mels=96, time_frames=64）
+            flops, params, flops_formatted, params_formatted = calculate_flops(
+                temp_model, 
+                input_shape=(1, 1, 96, 64),
+                device='cuda' if torch.cuda.is_available() else 'cpu'
+            )
+            
+            # 删除临时模型
+            del temp_model
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
+            # 记录到日志
+            self.logger("="*60, level=1)
+            self.logger("MODEL COMPLEXITY", level=1)
+            self.logger("="*60, level=1)
+            self.logger(f"FLOPs: {flops_formatted}", level=1)
+            self.logger(f"Parameters: {params_formatted}", level=1)
+            if flops is not None:
+                self.logger(f"FLOPs (exact): {flops:.0f}", level=2)
+                self.logger(f"Parameters (exact): {params:.0f}", level=2)
+            self.logger("="*60, level=1)
+            
+            print(f"FLOPs: {flops_formatted}")
+            print(f"Parameters: {params_formatted}")
+            print("="*60 + "\n")
+            
+        finally:
+            # 恢复所有随机状态，确保FLOPs计算不影响训练
+            torch.set_rng_state(torch_rng_state)
+            np.random.set_state(numpy_rng_state)
+            random.setstate(python_rng_state)
+            if torch.cuda.is_available():
+                torch.cuda.set_rng_state(cuda_rng_state)
+        
     def log_ablation_config(self):
         """记录消融实验配置"""
         self.logger("="*60, level=1)
