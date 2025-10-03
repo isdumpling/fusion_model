@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment
+venv/
+env/
+.env
+
+# Data files (too large for Git)
+data/
+*.wav
+*.mp3
+*.pth
+*.pt
+*.ckpt
+
+# Keep only specific data processing scripts
+!data/*.py
