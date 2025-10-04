@@ -253,6 +253,7 @@ class CrossDomainAudioTrainer:
     def train_stage2(self):
         """
         Stage 2: 分类器重训练 + 动态蒸馏
+        支持基于置信度的课程学习策略
         """
         print("=" * 50)
         print("Starting Stage 2: Classifier Retraining with Cross-Domain Distillation")
@@ -268,10 +269,51 @@ class CrossDomainAudioTrainer:
         optimizer = self.model.get_stage2_optimizer(lr=self.args.finetune_lr, weight_decay=self.args.finetune_wd)
         scheduler = lr_scheduler.CosineAnnealingLR(optimizer, self.args.finetune_epoch, eta_min=0.0)
         
+        # ===== 课程学习：预计算所有目标域样本的伪标签和置信度 =====
+        pseudo_label_info = None
+        if self.args.use_curriculum_learning:
+            print("\n" + "=" * 50)
+            print("Curriculum Learning Enabled - Precomputing Pseudo Labels")
+            print("=" * 50)
+            self.logger("Starting pseudo-label precomputation for curriculum learning...", level=1)
+            pseudo_label_info = self._precompute_pseudo_labels()
+            self.logger(f"Precomputed {len(pseudo_label_info)} samples with confidence scores", level=1)
+            print("=" * 50 + "\n")
+        
         start_time = time.time()
         
         for epoch in range(self.args.finetune_epoch):
-            train_results = self._train_stage2_epoch(optimizer)
+            # ===== 课程学习：动态筛选数据 =====
+            current_target_loader = self.target_unlabeled_loader  # 默认使用所有数据
+            num_selected_samples = len(self.target_trainset)
+            
+            if self.args.use_curriculum_learning and pseudo_label_info is not None:
+                # 计算当前epoch的置信度阈值（线性衰减）
+                current_threshold = self._compute_current_threshold(
+                    epoch, 
+                    self.args.finetune_epoch,
+                    self.args.initial_confidence_threshold,
+                    self.args.final_confidence_threshold
+                )
+                
+                # 根据阈值筛选样本
+                selected_indices = [idx for idx, conf in pseudo_label_info if conf >= current_threshold]
+                num_selected_samples = len(selected_indices)
+                
+                # 创建包含筛选样本的数据加载器
+                if num_selected_samples > 0:
+                    current_target_loader = self._create_filtered_loader(
+                        self.target_trainset,
+                        selected_indices,
+                        self.args.batch_size
+                    )
+                    self.logger(f"Epoch {epoch + 1}/{self.args.finetune_epoch}: Using {num_selected_samples}/{len(self.target_trainset)} target samples (threshold={current_threshold:.4f})", level=1)
+                else:
+                    # 如果没有样本满足阈值，使用全部数据
+                    self.logger(f"Epoch {epoch + 1}/{self.args.finetune_epoch}: No samples meet threshold {current_threshold:.4f}, using all samples", level=1)
+            
+            # 使用动态数据加载器进行训练
+            train_results = self._train_stage2_epoch(optimizer, current_target_loader, num_selected_samples)
             
             # Stage 2: 使用目标域测试集进行验证，使用滑动窗口
             test_loss, test_acc, test_cls, micro_f1, macro_f1, class_metrics = self._validate_stage2_sliding_window(self.target_testloader)
@@ -314,35 +356,164 @@ class CrossDomainAudioTrainer:
             progress_bar.set_postfix({'loss': f'{total_loss / num_batches:.4f}', 'acc': f'{total_acc / num_batches:.4f}'})
         return total_loss / num_batches, total_acc / num_batches
 
-    def _train_stage2_epoch(self, optimizer):
+    def _train_stage2_epoch(self, optimizer, target_loader=None, num_target_samples=None):
+        """
+        Stage 2 单个 epoch 的训练
+        
+        Args:
+            optimizer: 优化器
+            target_loader: 目标域数据加载器（如果为None，使用默认的self.target_unlabeled_loader）
+            num_target_samples: 目标域样本数量（用于日志记录）
+        """
         self.model.train()
+        
+        # 使用传入的 target_loader，如果没有则使用默认的
+        if target_loader is None:
+            target_loader = self.target_unlabeled_loader
+        
         total_loss, total_ce_loss, total_distill_loss, total_acc, num_batches = 0, 0, 0, 0, 0
-        target_iter = iter(self.target_unlabeled_loader)
+        target_iter = iter(target_loader)
         progress_bar = tqdm(self.source_trainloader, desc="Stage 2 Training")
+        
         for source_batch in progress_bar:
             source_batch = [item.cuda() for item in source_batch[:2]]
+            
+            # 从目标域数据加载器获取数据
             try:
                 target_batch = next(target_iter)
             except StopIteration:
-                target_iter = iter(self.target_unlabeled_loader)
+                # 如果目标域数据用完了，重新开始迭代
+                target_iter = iter(target_loader)
                 target_batch = next(target_iter)
+            
             x_target = target_batch[0].cuda()
+            # 创建弱增强和强增强版本
             x_u_weak = x_target
             x_u_strong = x_target + 0.01 * torch.randn_like(x_target)
             target_unlabeled = ((x_u_weak, x_u_strong),)
+            
             optimizer.zero_grad()
             results = self.model.compute_stage2_loss(source_batch, target_unlabeled)
             loss = results['loss']
             loss.backward()
             optimizer.step()
+            
             total_loss += loss.item()
             total_ce_loss += results['loss_ce'].item()
             total_distill_loss += results['loss_distill'].item()
             total_acc += results['train_acc'].item()
             num_batches += 1
-            progress_bar.set_postfix({'total_loss': f'{total_loss / num_batches:.4f}', 'acc': f'{total_acc / num_batches:.4f}'})
-        return {'total_loss': total_loss / num_batches, 'ce_loss': total_ce_loss / num_batches, 
-                'distill_loss': total_distill_loss / num_batches, 'train_acc': total_acc / num_batches}
+            
+            progress_bar.set_postfix({
+                'total_loss': f'{total_loss / num_batches:.4f}', 
+                'acc': f'{total_acc / num_batches:.4f}'
+            })
+        
+        return {
+            'total_loss': total_loss / num_batches, 
+            'ce_loss': total_ce_loss / num_batches, 
+            'distill_loss': total_distill_loss / num_batches, 
+            'train_acc': total_acc / num_batches
+        }
+    
+    def _precompute_pseudo_labels(self):
+        """
+        预计算所有目标域训练数据的伪标签和置信度
+        使用当前的教师模型（即Stage 1训练的最佳模型）进行预测
+        
+        Returns:
+            List[Tuple[int, float]]: 列表包含 (样本索引, 置信度) 元组
+        """
+        self.model.eval()
+        pseudo_label_info = []
+        
+        # 创建一个不打乱的数据加载器，用于预计算
+        precompute_loader = data.DataLoader(
+            self.target_trainset,
+            batch_size=self.args.batch_size,
+            shuffle=False,  # 不打乱，保持索引对应
+            num_workers=self.args.workers,
+            pin_memory=True
+        )
+        
+        with torch.no_grad():
+            current_idx = 0
+            for batch in tqdm(precompute_loader, desc="Precomputing Pseudo Labels"):
+                spectrograms = batch[0].cuda()
+                
+                # 使用教师模型进行预测
+                # 在Stage 2开始时，教师模型已经被创建，它是Stage 1最佳模型的副本
+                if self.model.teacher is not None:
+                    outputs = self.model.teacher(spectrograms)
+                else:
+                    # 如果教师模型还未创建，使用当前模型
+                    outputs = self.model(spectrograms)
+                
+                # 计算softmax概率
+                probs = torch.softmax(outputs, dim=1)
+                
+                # 获取最高概率（置信度）
+                max_probs, _ = torch.max(probs, dim=1)
+                
+                # 保存每个样本的索引和置信度
+                for i in range(max_probs.size(0)):
+                    confidence = max_probs[i].item()
+                    pseudo_label_info.append((current_idx, confidence))
+                    current_idx += 1
+        
+        # 按置信度降序排序（可选，但有助于调试）
+        pseudo_label_info.sort(key=lambda x: x[1], reverse=True)
+        
+        # 打印置信度统计信息
+        confidences = [conf for _, conf in pseudo_label_info]
+        self.logger(f"Confidence statistics - Min: {min(confidences):.4f}, Max: {max(confidences):.4f}, Mean: {np.mean(confidences):.4f}, Median: {np.median(confidences):.4f}", level=1)
+        
+        return pseudo_label_info
+    
+    def _compute_current_threshold(self, current_epoch, total_epochs, initial_threshold, final_threshold):
+        """
+        计算当前epoch的置信度阈值（线性衰减）
+        
+        Args:
+            current_epoch: 当前epoch（从0开始）
+            total_epochs: 总epoch数
+            initial_threshold: 初始置信度阈值
+            final_threshold: 最终置信度阈值
+            
+        Returns:
+            float: 当前epoch的置信度阈值
+        """
+        # 线性插值
+        progress = current_epoch / max(total_epochs - 1, 1)  # 避免除以0
+        current_threshold = initial_threshold - progress * (initial_threshold - final_threshold)
+        return current_threshold
+    
+    def _create_filtered_loader(self, dataset, selected_indices, batch_size):
+        """
+        创建一个只包含选定样本的数据加载器
+        
+        Args:
+            dataset: 完整的数据集
+            selected_indices: 选中的样本索引列表
+            batch_size: 批次大小
+            
+        Returns:
+            DataLoader: 筛选后的数据加载器
+        """
+        # 使用Subset创建子数据集
+        subset = data.Subset(dataset, selected_indices)
+        
+        # 创建数据加载器
+        filtered_loader = data.DataLoader(
+            subset,
+            batch_size=batch_size,
+            shuffle=True,  # 打乱选中的样本
+            num_workers=self.args.workers,
+            pin_memory=True,
+            drop_last=True  # 与原始loader保持一致
+        )
+        
+        return filtered_loader
     
     def _validate_stage1(self, testloader):
         """

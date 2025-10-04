@@ -91,6 +91,14 @@ def parse_args():
                              'combo3: Sampler + Focal (no logit adj), '
                              'combo4: Only Sampler, '
                              'combo5: ALl Enabled')
+    
+    # --- 课程学习参数 (Curriculum Learning for Stage 2) ---
+    parser.add_argument('--use_curriculum_learning', action='store_true', default=False,
+                        help='Enable curriculum learning based on teacher model confidence')
+    parser.add_argument('--initial_confidence_threshold', type=float, default=0.98,
+                        help='Initial confidence threshold for curriculum learning')
+    parser.add_argument('--final_confidence_threshold', type=float, default=0.70,
+                        help='Final confidence threshold for curriculum learning')
 
     args = parser.parse_args()
     
