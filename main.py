@@ -99,6 +99,12 @@ def parse_args():
                         help='Initial confidence threshold for curriculum learning')
     parser.add_argument('--final_confidence_threshold', type=float, default=0.70,
                         help='Final confidence threshold for curriculum learning')
+    
+    # --- Stage 2 源域数据使用参数 ---
+    parser.add_argument('--use_source_in_stage2', action='store_true', default=False,
+                        help='Use source domain data in stage 2 (in addition to target domain data)')
+    parser.add_argument('--source_target_ratio', type=float, default=1.0,
+                        help='Ratio of source to target batches in stage 2 when use_source_in_stage2 is enabled')
 
     args = parser.parse_args()
     
@@ -156,6 +162,10 @@ def parse_args():
         if components:
             ablation_suffix = "_" + "-".join(components)
     
+    # 添加 Stage 2 源域数据使用标识
+    if args.use_source_in_stage2:
+        ablation_suffix += f"_S2Src{args.source_target_ratio}"
+    
     args.out = os.path.join(args.out, f'{args.source_domain}_to_{args.target_domain}{ablation_suffix}_{time_str}')
 
     if args.gpu:
@@ -190,6 +200,9 @@ def main():
     print(f"Logit Adjustment: {'ENABLED' if args.use_logit_adjustment else 'DISABLED'}")
     if args.use_logit_adjustment:
         print(f"  - Tau: {args.logit_adj_tau}")
+    print(f"Stage 2 Use Source Data: {'ENABLED' if args.use_source_in_stage2 else 'DISABLED'}")
+    if args.use_source_in_stage2:
+        print(f"  - Source/Target Ratio: {args.source_target_ratio}")
     print("="*60 + "\n")
 
     # 实例化训练器

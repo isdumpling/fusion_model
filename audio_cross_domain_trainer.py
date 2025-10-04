@@ -203,6 +203,9 @@ class CrossDomainAudioTrainer:
         if self.args.use_logit_adjustment:
             self.logger(f"  - Tau: {self.args.logit_adj_tau}", level=2)
         self.logger(f"Label Smoothing: {self.args.label_smooth}", level=1)
+        self.logger(f"Stage 2 Use Source Data: {'ENABLED' if self.args.use_source_in_stage2 else 'DISABLED'}", level=1)
+        if self.args.use_source_in_stage2:
+            self.logger(f"  - Source/Target Ratio: {self.args.source_target_ratio}", level=2)
         self.logger("="*60, level=1)
     
     def train_stage1(self):
@@ -265,6 +268,11 @@ class CrossDomainAudioTrainer:
         """
         print("=" * 50)
         print("Starting Stage 2: Classifier Retraining with Cross-Domain Distillation")
+        if self.args.use_source_in_stage2:
+            print(f"[INFO] Stage 2 将同时使用源域数据（监督学习）和目标域数据（自我学习）")
+            print(f"[INFO] 源域/目标域批次比率: {self.args.source_target_ratio}")
+        else:
+            print(f"[INFO] Stage 2 仅使用目标域数据（纯自我学习）")
         print("=" * 50)
         
         if self.best_model is not None:
@@ -366,7 +374,9 @@ class CrossDomainAudioTrainer:
 
     def _train_stage2_epoch(self, optimizer, target_loader=None, num_target_samples=None):
         """
-        Stage 2 单个 epoch 的训练 - 仅使用目标域数据
+        Stage 2 单个 epoch 的训练
+        - 默认：仅使用目标域数据（无标签自我学习）
+        - 可选：同时使用源域数据（有标签监督学习）+ 目标域数据
         """
         self.model.train()
         
@@ -374,58 +384,155 @@ class CrossDomainAudioTrainer:
             target_loader = self.target_unlabeled_loader
         
         total_loss, total_ce_loss, total_distill_loss, total_acc, num_batches = 0, 0, 0, 0, 0
+        total_source_loss = 0  # 源域监督损失
         
-        # 核心修改：主循环现在遍历目标域数据加载器
-        progress_bar = tqdm(target_loader, desc="Stage 2 Training")
-        
-        for target_batch in progress_bar:
-            # target_batch[0] 是频谱图, target_batch[3] 是波形
-            spectrogram_target = target_batch[0].cuda()
-            waveform_target = target_batch[3].cuda()
+        # 如果启用了源域数据使用
+        if self.args.use_source_in_stage2:
+            # 创建源域和目标域数据的迭代器
+            source_iter = iter(self.source_trainloader)
+            target_iter = iter(target_loader)
             
-            # 弱增强版本直接使用 dataloader 的输出（智能裁剪后的频谱图）
-            x_u_weak_spec = spectrogram_target
+            # 计算总批次数（基于目标域）
+            num_target_batches = len(target_loader)
+            num_source_batches_per_target = self.args.source_target_ratio
+            
+            progress_bar = tqdm(range(num_target_batches), desc="Stage 2 Training (Source+Target)")
+            
+            for _ in progress_bar:
+                # ========== 处理目标域数据（蒸馏损失） ==========
+                try:
+                    target_batch = next(target_iter)
+                except StopIteration:
+                    target_iter = iter(target_loader)
+                    target_batch = next(target_iter)
+                
+                spectrogram_target = target_batch[0].cuda()
+                waveform_target = target_batch[3].cuda()
+                
+                # 弱增强版本
+                x_u_weak_spec = spectrogram_target
+                
+                # 强增强版本
+                x_u_strong_waveform = self.strong_augment(samples=waveform_target, sample_rate=16000)
+                mel_transform = torchaudio.transforms.MelSpectrogram(
+                    sample_rate=16000, n_fft=400, win_length=400, hop_length=160, 
+                    n_mels=self.args.num_mels if hasattr(self.args, 'num_mels') else 96,
+                    f_min=125, f_max=7500
+                ).cuda()
+                mel_strong = mel_transform(x_u_strong_waveform)
+                x_u_strong_spec = torch.log(mel_strong + 1e-9)
+                
+                target_unlabeled = ((x_u_weak_spec, x_u_strong_spec),)
+                
+                # 计算目标域损失
+                optimizer.zero_grad()
+                target_results = self.model.compute_stage2_loss(target_unlabeled)
+                target_loss = target_results['loss']
+                
+                # ========== 处理源域数据（监督损失） ==========
+                source_loss = 0
+                if num_source_batches_per_target > 0:
+                    for _ in range(int(num_source_batches_per_target)):
+                        try:
+                            source_batch = next(source_iter)
+                        except StopIteration:
+                            source_iter = iter(self.source_trainloader)
+                            source_batch = next(source_iter)
+                        
+                        source_spec = source_batch[0].cuda()
+                        source_label = source_batch[1].cuda()
+                        
+                        # 对源域数据使用监督学习
+                        source_output = self.model(source_spec)
+                        source_batch_loss = self.model.compute_validation_loss(source_output, source_label)
+                        source_loss += source_batch_loss
+                    
+                    # 平均源域损失
+                    source_loss = source_loss / max(1, int(num_source_batches_per_target))
+                
+                # ========== 组合损失 ==========
+                # 组合目标域损失和源域损失
+                combined_loss = target_loss + source_loss
+                
+                combined_loss.backward()
+                optimizer.step()
+                
+                # 更新统计
+                total_loss += combined_loss.item()
+                total_ce_loss += target_results['loss_ce'].item()
+                total_distill_loss += target_results['loss_distill'].item()
+                total_source_loss += source_loss.item() if isinstance(source_loss, torch.Tensor) else source_loss
+                total_acc += target_results['train_acc'].item()
+                num_batches += 1
+                
+                progress_bar.set_postfix({
+                    'total': f'{total_loss / num_batches:.4f}',
+                    'target': f'{target_loss.item():.4f}',
+                    'source': f'{source_loss.item() if isinstance(source_loss, torch.Tensor) else source_loss:.4f}',
+                    'acc': f'{total_acc / num_batches:.4f}'
+                })
+            
+            return {
+                'total_loss': total_loss / num_batches, 
+                'ce_loss': total_ce_loss / num_batches, 
+                'distill_loss': total_distill_loss / num_batches, 
+                'source_loss': total_source_loss / num_batches,
+                'train_acc': total_acc / num_batches
+            }
+        
+        else:
+            # ========== 原始逻辑：仅使用目标域数据 ==========
+            progress_bar = tqdm(target_loader, desc="Stage 2 Training (Target Only)")
+            
+            for target_batch in progress_bar:
+                # target_batch[0] 是频谱图, target_batch[3] 是波形
+                spectrogram_target = target_batch[0].cuda()
+                waveform_target = target_batch[3].cuda()
+                
+                # 弱增强版本直接使用 dataloader 的输出（智能裁剪后的频谱图）
+                x_u_weak_spec = spectrogram_target
 
-            # 在波形上应用强数据增强
-            x_u_strong_waveform = self.strong_augment(samples=waveform_target, sample_rate=16000)
+                # 在波形上应用强数据增强
+                x_u_strong_waveform = self.strong_augment(samples=waveform_target, sample_rate=16000)
 
-            # 将强增强后的波形转换为频谱图
-            mel_transform = torchaudio.transforms.MelSpectrogram(
-                sample_rate=16000, n_fft=400, win_length=400, hop_length=160, 
-                n_mels=self.args.num_mels if hasattr(self.args, 'num_mels') else 96,
-                f_min=125, f_max=7500
-            ).cuda()
-            mel_strong = mel_transform(x_u_strong_waveform)
-            x_u_strong_spec = torch.log(mel_strong + 1e-9)
+                # 将强增强后的波形转换为频谱图
+                mel_transform = torchaudio.transforms.MelSpectrogram(
+                    sample_rate=16000, n_fft=400, win_length=400, hop_length=160, 
+                    n_mels=self.args.num_mels if hasattr(self.args, 'num_mels') else 96,
+                    f_min=125, f_max=7500
+                ).cuda()
+                mel_strong = mel_transform(x_u_strong_waveform)
+                x_u_strong_spec = torch.log(mel_strong + 1e-9)
+                
+                target_unlabeled = ((x_u_weak_spec, x_u_strong_spec),)
+                
+                optimizer.zero_grad()
+                
+                # 调用新的损失函数，只传入目标域数据
+                results = self.model.compute_stage2_loss(target_unlabeled)
+                loss = results['loss']
+                
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item()
+                total_ce_loss += results['loss_ce'].item()
+                total_distill_loss += results['loss_distill'].item()
+                total_acc += results['train_acc'].item()
+                num_batches += 1
+                
+                progress_bar.set_postfix({
+                    'total_loss': f'{total_loss / num_batches:.4f}', 
+                    'acc': f'{total_acc / num_batches:.4f}'
+                })
             
-            target_unlabeled = ((x_u_weak_spec, x_u_strong_spec),)
-            
-            optimizer.zero_grad()
-            
-            # 调用新的损失函数，只传入目标域数据
-            results = self.model.compute_stage2_loss(target_unlabeled)
-            loss = results['loss']
-            
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            total_ce_loss += results['loss_ce'].item()
-            total_distill_loss += results['loss_distill'].item()
-            total_acc += results['train_acc'].item()
-            num_batches += 1
-            
-            progress_bar.set_postfix({
-                'total_loss': f'{total_loss / num_batches:.4f}', 
-                'acc': f'{total_acc / num_batches:.4f}'
-            })
-        
-        return {
-            'total_loss': total_loss / num_batches, 
-            'ce_loss': total_ce_loss / num_batches, 
-            'distill_loss': total_distill_loss / num_batches, 
-            'train_acc': total_acc / num_batches
-        }
+            return {
+                'total_loss': total_loss / num_batches, 
+                'ce_loss': total_ce_loss / num_batches, 
+                'distill_loss': total_distill_loss / num_batches,
+                'source_loss': 0.0,  # 未使用源域数据
+                'train_acc': total_acc / num_batches
+            }
     
     def _precompute_pseudo_labels(self):
         """
@@ -766,7 +873,13 @@ class CrossDomainAudioTrainer:
     def _log_stage2_epoch(self, epoch, train_results, test_loss, test_acc, test_cls, lr, micro_f1, macro_f1, class_metrics):
         """记录Stage 2 epoch结果"""
         self.logger(f'Stage2 - Epoch: [{epoch} | {self.args.finetune_epoch}]', level=1)
-        self.logger(f'[Train]\tTotal Loss:\t{train_results["total_loss"]:.4f}\tCE Loss:\t{train_results["ce_loss"]:.4f}\tDistill Loss:\t{train_results["distill_loss"]:.4f}', level=2)
+        
+        # 根据是否使用源域数据显示不同的损失信息
+        if self.args.use_source_in_stage2:
+            self.logger(f'[Train]\tTotal Loss:\t{train_results["total_loss"]:.4f}\tCE Loss:\t{train_results["ce_loss"]:.4f}\tDistill Loss:\t{train_results["distill_loss"]:.4f}\tSource Loss:\t{train_results["source_loss"]:.4f}', level=2)
+        else:
+            self.logger(f'[Train]\tTotal Loss:\t{train_results["total_loss"]:.4f}\tCE Loss:\t{train_results["ce_loss"]:.4f}\tDistill Loss:\t{train_results["distill_loss"]:.4f}', level=2)
+        
         self.logger(f'[Train]\tAcc:\t{train_results["train_acc"]:.4f}', level=2)
         self.logger(f'[Test ]\tLoss:\t{test_loss:.4f}\tAcc:\t{test_acc:.4f}', level=2)
         self.logger(f'[Test ]\tMicro F1:\t{micro_f1:.4f}\tMacro F1:\t{macro_f1:.4f}', level=2)
