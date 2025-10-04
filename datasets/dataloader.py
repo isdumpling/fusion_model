@@ -94,8 +94,18 @@ class AudioLongTailDataset(Dataset):
         if self.transform:
             log_mel_spectrogram = self.transform(log_mel_spectrogram)
 
-        # Stage 2 目标域测试：额外返回 waveform 用于静音检测
-        if self.mode == 'test' and self.domain == 'target':
+        # 目标域：总是返回 waveform（用于 Stage 2 的强增强和测试时的静音检测）
+        if self.domain == 'target':
+            # 训练模式：确保 waveform 长度一致以便 batch 化
+            if self.mode == 'train':
+                target_waveform_length = self.target_length * 160  # 160 是 hop_length
+                if waveform.shape[1] > target_waveform_length:
+                    waveform = waveform[:, :target_waveform_length]
+                else:
+                    padding = target_waveform_length - waveform.shape[1]
+                    waveform = torch.nn.functional.pad(waveform, (0, padding))
+            # 测试模式：保持原始长度（用于滑动窗口）
+            
             return log_mel_spectrogram, label, idx, waveform
         
         return log_mel_spectrogram, label, idx

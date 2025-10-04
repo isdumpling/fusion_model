@@ -11,6 +11,8 @@ import torch.utils.data as data
 from torch.utils.data.sampler import WeightedRandomSampler
 from sklearn.metrics import f1_score
 import librosa
+import torchaudio
+from torch_audiomentations import Compose, PitchShift, Gain
 
 from datasets.dataloader import get_cross_domain_audio_dataset
 from audio_distill_los_system import AudioDistillLOSSystem
@@ -51,6 +53,11 @@ class CrossDomainAudioTrainer:
         
         # 计算并记录模型FLOPs和参数量（在独立的随机状态下）
         self._compute_and_log_flops()
+        
+        self.strong_augment = Compose([
+            PitchShift(min_transpose_semitones=-4, max_transpose_semitones=4, sample_rate=16000, p=0.5),  # 随机变调
+            Gain(min_gain_in_db=-12, max_gain_in_db=12, p=0.5),              # 随机调整增益（音量）
+        ])
         
     def setup_data(self):
         """设置数据加载器"""
@@ -359,43 +366,46 @@ class CrossDomainAudioTrainer:
 
     def _train_stage2_epoch(self, optimizer, target_loader=None, num_target_samples=None):
         """
-        Stage 2 单个 epoch 的训练
-        
-        Args:
-            optimizer: 优化器
-            target_loader: 目标域数据加载器（如果为None，使用默认的self.target_unlabeled_loader）
-            num_target_samples: 目标域样本数量（用于日志记录）
+        Stage 2 单个 epoch 的训练 - 仅使用目标域数据
         """
         self.model.train()
         
-        # 使用传入的 target_loader，如果没有则使用默认的
         if target_loader is None:
             target_loader = self.target_unlabeled_loader
         
         total_loss, total_ce_loss, total_distill_loss, total_acc, num_batches = 0, 0, 0, 0, 0
-        target_iter = iter(target_loader)
-        progress_bar = tqdm(self.source_trainloader, desc="Stage 2 Training")
         
-        for source_batch in progress_bar:
-            source_batch = [item.cuda() for item in source_batch[:2]]
+        # 核心修改：主循环现在遍历目标域数据加载器
+        progress_bar = tqdm(target_loader, desc="Stage 2 Training")
+        
+        for target_batch in progress_bar:
+            # target_batch[0] 是频谱图, target_batch[3] 是波形
+            spectrogram_target = target_batch[0].cuda()
+            waveform_target = target_batch[3].cuda()
             
-            # 从目标域数据加载器获取数据
-            try:
-                target_batch = next(target_iter)
-            except StopIteration:
-                # 如果目标域数据用完了，重新开始迭代
-                target_iter = iter(target_loader)
-                target_batch = next(target_iter)
+            # 弱增强版本直接使用 dataloader 的输出（智能裁剪后的频谱图）
+            x_u_weak_spec = spectrogram_target
+
+            # 在波形上应用强数据增强
+            x_u_strong_waveform = self.strong_augment(samples=waveform_target, sample_rate=16000)
+
+            # 将强增强后的波形转换为频谱图
+            mel_transform = torchaudio.transforms.MelSpectrogram(
+                sample_rate=16000, n_fft=400, win_length=400, hop_length=160, 
+                n_mels=self.args.num_mels if hasattr(self.args, 'num_mels') else 96,
+                f_min=125, f_max=7500
+            ).cuda()
+            mel_strong = mel_transform(x_u_strong_waveform)
+            x_u_strong_spec = torch.log(mel_strong + 1e-9)
             
-            x_target = target_batch[0].cuda()
-            # 创建弱增强和强增强版本
-            x_u_weak = x_target
-            x_u_strong = x_target + 0.01 * torch.randn_like(x_target)
-            target_unlabeled = ((x_u_weak, x_u_strong),)
+            target_unlabeled = ((x_u_weak_spec, x_u_strong_spec),)
             
             optimizer.zero_grad()
-            results = self.model.compute_stage2_loss(source_batch, target_unlabeled)
+            
+            # 调用新的损失函数，只传入目标域数据
+            results = self.model.compute_stage2_loss(target_unlabeled)
             loss = results['loss']
+            
             loss.backward()
             optimizer.step()
             

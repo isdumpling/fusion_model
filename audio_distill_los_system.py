@@ -123,37 +123,42 @@ class AudioDistillLOSSystem(nn.Module):
             'stage': 'stage1'
         }
     
-    def compute_stage2_loss(self, batch_labeled, batch_unlabeled):
+    def compute_stage2_loss(self, batch_unlabeled):
         """
-        Stage 2: 融合各种技术的分类器微调阶段
+        Stage 2: 仅使用目标域数据进行自我蒸馏和伪标签学习
         """
-        x_labeled, y_labeled = batch_labeled
         (x_u_weak, x_u_strong), *_ = batch_unlabeled
         
-        # 前向传播
-        scores_labeled, scores_u_strong = self.set_forward(x_labeled, x_u_strong)
+        # 教师模型处理弱增强数据，生成"真理"
+        with torch.no_grad():
+            teacher_scores = self.teacher(x_u_weak)
+            teacher_probs = F.softmax(teacher_scores, dim=-1)
+            # 创建硬伪标签用于额外的监督损失
+            pseudo_labels = torch.argmax(teacher_scores, dim=1)
+
+        # 学生模型处理强增强数据
+        student_scores = self.student(x_u_strong)
         
-        # 使用配置的损失函数计算监督损失
-        loss_ce = self.loss_function(scores_labeled, y_labeled)
+        # 1. 监督损失：使用教师的硬伪标签
+        #    这提供了一个非常强的梯度信号
+        loss_ce = F.cross_entropy(student_scores, pseudo_labels)
+
+        # 2. 蒸馏损失：使用教师的软标签（概率分布）
+        student_log_probs = F.log_softmax(student_scores, dim=-1)
+        distill_loss = F.kl_div(student_log_probs, teacher_probs.detach(), reduction='batchmean')
         
-        # 计算训练准确率
-        train_acc = accuracy(scores_labeled.argmax(dim=-1), y_labeled, 
-                           task='multiclass', num_classes=self.num_classes)
-        
-        # dynamic-cdfsl伪标签蒸馏损失 (处理跨域问题)
-        if self.teacher is not None:
-            loss_distill = self._compute_distillation_loss(x_u_weak, scores_u_strong)
-        else:
-            loss_distill = torch.tensor(0.0).to(scores_labeled.device)
-        
-        # 总损失
+        # 总损失：结合两种损失
         distill_weight = getattr(self.hparams, 'distill_weight', 1.0)
-        total_loss = loss_ce + distill_weight * loss_distill
+        total_loss = loss_ce + distill_weight * distill_loss
+        
+        # 计算伪标签的准确率（用于监控）
+        train_acc = accuracy(student_scores.argmax(dim=-1), pseudo_labels, 
+                           task='multiclass', num_classes=self.num_classes)
         
         return {
             'loss': total_loss,
             'loss_ce': loss_ce,
-            'loss_distill': loss_distill,
+            'loss_distill': distill_loss,
             'train_acc': train_acc,
             'stage': 'stage2'
         }
