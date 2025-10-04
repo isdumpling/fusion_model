@@ -10,6 +10,7 @@ from torch.optim import lr_scheduler
 import torch.utils.data as data
 from torch.utils.data.sampler import WeightedRandomSampler
 from sklearn.metrics import f1_score
+import librosa
 
 from datasets.dataloader import get_cross_domain_audio_dataset
 from audio_distill_los_system import AudioDistillLOSSystem
@@ -586,7 +587,7 @@ class CrossDomainAudioTrainer:
     
     def _validate_stage2_sliding_window(self, testloader):
         """
-        Stage 2 验证：使用滑动窗口处理目标域数据
+        Stage 2 验证：先通过静音检测提取有效事件，再对每个事件应用滑动窗口
         """
         self.model.eval()
         
@@ -594,9 +595,9 @@ class CrossDomainAudioTrainer:
         # sample_rate=16000, hop_length=160 -> 1 frame = 160/16000 = 0.01s
         window_frames = int(self.args.window_size / 0.01)  # 0.8秒 = 80帧
         hop_frames = int(self.args.hop_size / 0.01)  # 0.5秒 = 50帧
+        hop_length = 160  # 音频处理的hop_length，用于样本索引到帧索引的转换
         
         # 从dataloader获取训练时使用的固定长度
-        # Stage 2的滑动窗口需要调整到与Stage 1训练时相同的大小
         from datasets.dataloader import TARGET_LENGTH
         model_input_frames = TARGET_LENGTH  # 64帧，与Stage 1训练时一致
         
@@ -608,52 +609,84 @@ class CrossDomainAudioTrainer:
         
         # testloader的batch_size必须为1
         with torch.no_grad():
-            for spectrogram, target, _ in tqdm(testloader, desc="Stage 2 Sliding Window Validation"):
+            for spectrogram, target, _, waveform in tqdm(testloader, desc="Stage 2 Sliding Window Validation"):
                 spectrogram = spectrogram.cuda()
                 target = target.cuda()
                 
-                # 如果音频太短，无法使用滑动窗口，直接调整到模型输入大小
-                if spectrogram.shape[3] <= window_frames:
-                    # 调整到模型期望的输入大小（64帧）
-                    if spectrogram.shape[3] < model_input_frames:
-                        padding = model_input_frames - spectrogram.shape[3]
-                        spectrogram = torch.nn.functional.pad(spectrogram, (0, padding))
-                    elif spectrogram.shape[3] > model_input_frames:
-                        spectrogram = spectrogram[:, :, :, :model_input_frames]
+                # 将 waveform 转换为 NumPy 数组，确保是单声道
+                audio_np = waveform.squeeze().cpu().numpy()
+                
+                # 使用 librosa 进行静音检测，提取所有非静音片段
+                # top_db=20 表示低于峰值音量20dB的部分被视为静音
+                try:
+                    intervals = librosa.effects.split(audio_np, top_db=20)
+                except Exception as e:
+                    # 如果静音检测失败，回退到全音频处理
+                    print(f"Warning: librosa.effects.split failed: {e}, using full audio")
+                    intervals = np.array([[0, len(audio_np)]])
+                
+                # 初始化最终预测结果：默认为 non-cough (label 1)
+                final_prediction = 1
+                found_cough = False
+                
+                # 遍历每个非静音片段
+                for start_sample, end_sample in intervals:
+                    if found_cough:
+                        break  # 已检测到 cough，跳出事件循环
                     
-                    outputs = self.model(spectrogram)
-                    _, predicted = outputs.max(1)
-                    final_prediction = predicted.item()
-                else:
-                    # 使用滑动窗口：默认预测为 non-cough (label 1)
-                    final_prediction = 1 
+                    # 将样本索引转换为频谱图帧索引
+                    start_frame = start_sample // hop_length
+                    end_frame = end_sample // hop_length
                     
-                    start = 0
-                    while start + window_frames <= spectrogram.shape[3]:
-                        # 提取滑动窗口（80帧）
-                        window = spectrogram[:, :, :, start:start + window_frames]
+                    # 提取事件对应的频谱图片段
+                    event_spectrogram = spectrogram[:, :, :, start_frame:end_frame]
+                    
+                    # 如果事件片段太短，无法使用滑动窗口
+                    if event_spectrogram.shape[3] <= window_frames:
+                        # 调整到模型期望的输入大小（64帧）
+                        if event_spectrogram.shape[3] < model_input_frames:
+                            padding = model_input_frames - event_spectrogram.shape[3]
+                            event_spectrogram = torch.nn.functional.pad(event_spectrogram, (0, padding))
+                        elif event_spectrogram.shape[3] > model_input_frames:
+                            event_spectrogram = event_spectrogram[:, :, :, :model_input_frames]
                         
-                        # 将窗口调整到模型期望的输入大小（64帧）
-                        # 窗口是80帧，需要裁剪到64帧
-                        if window.shape[3] > model_input_frames:
-                            # 取中心部分64帧
-                            excess = window.shape[3] - model_input_frames
-                            start_trim = excess // 2
-                            window = window[:, :, :, start_trim:start_trim + model_input_frames]
-                        elif window.shape[3] < model_input_frames:
-                            # 理论上不应该发生，因为window_frames=80 > model_input_frames=64
-                            padding = model_input_frames - window.shape[3]
-                            window = torch.nn.functional.pad(window, (0, padding))
-                        
-                        outputs = self.model(window)
+                        outputs = self.model(event_spectrogram)
                         _, predicted = outputs.max(1)
                         
-                        # 假设 cough 的标签为 0
-                        if predicted.item() == 0:
+                        if predicted.item() == 0:  # 检测到 cough
                             final_prediction = 0
-                            break # 检测到cough，立即停止对此文件的处理
+                            found_cough = True
+                            break
+                    else:
+                        # 对事件片段应用滑动窗口检测
+                        event_start = 0
+                        while event_start + window_frames <= event_spectrogram.shape[3]:
+                            # 提取滑动窗口（80帧）
+                            window = event_spectrogram[:, :, :, event_start:event_start + window_frames]
                             
-                        start += hop_frames
+                            # 将窗口调整到模型期望的输入大小（64帧）
+                            if window.shape[3] > model_input_frames:
+                                # 取中心部分64帧
+                                excess = window.shape[3] - model_input_frames
+                                start_trim = excess // 2
+                                window = window[:, :, :, start_trim:start_trim + model_input_frames]
+                            elif window.shape[3] < model_input_frames:
+                                padding = model_input_frames - window.shape[3]
+                                window = torch.nn.functional.pad(window, (0, padding))
+                            
+                            outputs = self.model(window)
+                            _, predicted = outputs.max(1)
+                            
+                            # 假设 cough 的标签为 0
+                            if predicted.item() == 0:
+                                final_prediction = 0
+                                found_cough = True
+                                break  # 检测到 cough，跳出滑动窗口循环
+                                
+                            event_start += hop_frames
+                        
+                        if found_cough:
+                            break  # 跳出事件循环
                 
                 all_preds.append(final_prediction)
                 all_targets.append(target.item())

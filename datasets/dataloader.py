@@ -94,6 +94,10 @@ class AudioLongTailDataset(Dataset):
         if self.transform:
             log_mel_spectrogram = self.transform(log_mel_spectrogram)
 
+        # Stage 2 目标域测试：额外返回 waveform 用于静音检测
+        if self.mode == 'test' and self.domain == 'target':
+            return log_mel_spectrogram, label, idx, waveform
+        
         return log_mel_spectrogram, label, idx
 
 def _load_domain_data(domain_dir, class_to_idx):
