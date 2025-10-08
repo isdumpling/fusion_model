@@ -14,7 +14,7 @@ import librosa
 import torchaudio
 from torch_audiomentations import Compose, PitchShift, Gain
 
-from datasets.dataloader import get_cross_domain_audio_dataset
+from datasets.dataloader import get_cross_domain_audio_dataset, FilteredCoughSegmentDataset
 from audio_distill_los_system import AudioDistillLOSSystem
 from utils.common import hms_string, calculate_flops
 from utils.logger import logger
@@ -206,6 +206,9 @@ class CrossDomainAudioTrainer:
         self.logger(f"Stage 2 Use Source Data: {'ENABLED' if self.args.use_source_in_stage2 else 'DISABLED'}", level=1)
         if self.args.use_source_in_stage2:
             self.logger(f"  - Source/Target Ratio: {self.args.source_target_ratio}", level=2)
+        self.logger(f"Stage 2 Sliding Window Filter: {'ENABLED' if getattr(self.args, 'use_sliding_window_filter', False) else 'DISABLED'}", level=1)
+        if getattr(self.args, 'use_sliding_window_filter', False):
+            self.logger(f"  - Confidence Threshold: {getattr(self.args, 'filter_confidence_threshold', 0.95)}", level=2)
         self.logger("="*60, level=1)
     
     def train_stage1(self):
@@ -261,6 +264,202 @@ class CrossDomainAudioTrainer:
         self.logger(f'Stage 1 Training Time: {hms_string(end_time - start_time)}', level=1)
         self.logger(f'Stage 1 Best Macro F1: {self.best_macro_f1:.4f}', level=1)
         
+    def _preprocess_target_data_with_sliding_window(self, confidence_threshold=0.95):
+        """
+        使用 Stage 1 训练好的模型，对目标域训练数据进行滑动窗口预处理
+        只保留模型认为是 cough 的窗口片段
+        
+        Args:
+            confidence_threshold: 置信度阈值，只保留置信度高于此值的 cough 片段
+            
+        Returns:
+            FilteredCoughSegmentDataset: 筛选后的数据集
+        """
+        print("\n" + "=" * 60)
+        print("Stage 2 预处理：使用滑动窗口筛选 Cough 片段")
+        print("=" * 60)
+        self.logger(f"Confidence threshold: {confidence_threshold}", level=1)
+        
+        self.model.eval()
+        
+        # 滑动窗口参数
+        # 注意：filter_window_size 必须大于 model_input_frames 才能进行真正的滑动窗口
+        filter_window_size = getattr(self.args, 'filter_window_size', 0.8)  # 默认0.8秒，大于模型输入
+        filter_hop_size = getattr(self.args, 'filter_hop_size', 0.4)  # 默认0.4秒，50%重叠
+        
+        window_frames = int(filter_window_size / 0.01)  # 转换为帧数
+        hop_frames = int(filter_hop_size / 0.01)
+        hop_length = 160  # 音频处理的 hop_length
+        
+        # 静音检测参数
+        use_silence_removal = getattr(self.args, 'filter_use_silence_removal', True)
+        silence_top_db = getattr(self.args, 'filter_silence_top_db', 30)  # 提高到30，更宽松
+        
+        print(f"滑动窗口配置:")
+        print(f"  - 窗口大小: {filter_window_size}秒 ({window_frames}帧)")
+        print(f"  - 步长: {filter_hop_size}秒 ({hop_frames}帧)")
+        print(f"  - 静音检测: {'启用' if use_silence_removal else '禁用'}")
+        if use_silence_removal:
+            print(f"  - 静音阈值: {silence_top_db}dB")
+        
+        from datasets.dataloader import TARGET_LENGTH, AudioLongTailDataset
+        model_input_frames = TARGET_LENGTH  # 64帧
+        
+        filtered_segments = []
+        
+        # BUG修复：创建一个临时的、加载完整音频的数据集用于预处理
+        # 关键：设置 mode='test', domain='target' 来禁用训练时的长度裁剪
+        preprocess_dataset = AudioLongTailDataset(
+            data_frame=self.target_trainset.data_frame,
+            data_dir=self.args.data_dir,
+            mode='test',
+            domain='target'
+        )
+        
+        temp_loader = data.DataLoader(
+            preprocess_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=self.args.workers,
+            pin_memory=True
+        )
+        
+        total_samples = len(preprocess_dataset)
+        total_windows_checked = 0
+        total_cough_windows_found = 0
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(temp_loader, desc="筛选 Cough 片段")):
+                spectrogram, label, _, waveform = batch
+                spectrogram = spectrogram.cuda()
+                
+                # 获取文件路径
+                file_path = preprocess_dataset.data_frame.iloc[batch_idx, 0]
+                true_label = label.item()
+                
+                # 将 waveform 转换为 NumPy 数组
+                audio_np = waveform.squeeze().cpu().numpy()
+                
+                # 使用 librosa 进行静音检测（可选）
+                if use_silence_removal:
+                    try:
+                        intervals = librosa.effects.split(audio_np, top_db=silence_top_db)
+                        # 如果没有检测到任何非静音片段，使用完整音频
+                        if len(intervals) == 0:
+                            intervals = np.array([[0, len(audio_np)]])
+                    except Exception as e:
+                        print(f"Warning: librosa.effects.split failed: {e}, using full audio")
+                        intervals = np.array([[0, len(audio_np)]])
+                else:
+                    # 不使用静音检测，处理完整音频
+                    intervals = np.array([[0, len(audio_np)]])
+                
+                # 遍历每个非静音片段
+                for start_sample, end_sample in intervals:
+                    # 将样本索引转换为频谱图帧索引
+                    start_frame = start_sample // hop_length
+                    end_frame = end_sample // hop_length
+                    
+                    # 提取事件对应的频谱图片段
+                    event_spectrogram = spectrogram[:, :, :, start_frame:end_frame]
+                    
+                    # 对所有足够长的片段使用滑动窗口
+                    if event_spectrogram.shape[3] < model_input_frames:
+                        # 片段太短，无法形成有效窗口，跳过
+                        continue
+                    
+                    # 使用滑动窗口扫描整个片段（不区分长短）
+                    event_start = 0
+                    event_length = event_spectrogram.shape[3]
+                    
+                    # 如果片段长度 <= window_frames，使用更密集的扫描
+                    if event_length <= window_frames:
+                        # 短片段：使用 model_input_frames 作为步长，确保完整覆盖
+                        scan_hop = max(1, model_input_frames // 2)  # 50% 重叠
+                    else:
+                        # 长片段：使用配置的 hop_frames
+                        scan_hop = hop_frames
+                    
+                    # 统一的滑动窗口扫描逻辑
+                    while event_start + model_input_frames <= event_length:
+                        # 提取当前位置的窗口（固定大小 = model_input_frames）
+                        window = event_spectrogram[:, :, :, event_start:event_start + model_input_frames]
+                        
+                        # 确保窗口大小正确（通常已经正确，但以防万一）
+                        if window.shape[3] < model_input_frames:
+                            padding = model_input_frames - window.shape[3]
+                            window = torch.nn.functional.pad(window, (0, padding))
+                        
+                        outputs = self.model(window)
+                        probs = torch.softmax(outputs, dim=1)
+                        predicted_class = outputs.argmax(1).item()
+                        confidence = probs[0, predicted_class].item()
+                        
+                        total_windows_checked += 1
+                        
+                        # 如果预测为 cough (label 0) 且置信度足够高
+                        if predicted_class == 0 and confidence >= confidence_threshold:
+                            filtered_segments.append({
+                                'file_path': file_path,
+                                'label': true_label,
+                                'start_frame': start_frame + event_start,
+                                'end_frame': start_frame + event_start + model_input_frames,
+                                'confidence': confidence
+                            })
+                            total_cough_windows_found += 1
+                        
+                        event_start += scan_hop
+                    
+                    # 确保扫描到末尾：检查最后一个可能的窗口
+                    if event_start < event_length and event_length >= model_input_frames:
+                        # 从末尾对齐的最后一个窗口
+                        last_start = event_length - model_input_frames
+                        if last_start > event_start - scan_hop:  # 避免重复检查
+                            window = event_spectrogram[:, :, :, last_start:last_start + model_input_frames]
+                            
+                            outputs = self.model(window)
+                            probs = torch.softmax(outputs, dim=1)
+                            predicted_class = outputs.argmax(1).item()
+                            confidence = probs[0, predicted_class].item()
+                            
+                            total_windows_checked += 1
+                            
+                            if predicted_class == 0 and confidence >= confidence_threshold:
+                                filtered_segments.append({
+                                    'file_path': file_path,
+                                    'label': true_label,
+                                    'start_frame': start_frame + last_start,
+                                    'end_frame': start_frame + last_start + model_input_frames,
+                                    'confidence': confidence
+                                })
+                                total_cough_windows_found += 1
+        
+        print("=" * 60)
+        print(f"筛选完成:")
+        print(f"  - 总样本数: {total_samples}")
+        print(f"  - 检查的窗口总数: {total_windows_checked}")
+        print(f"  - 找到的 Cough 窗口数: {total_cough_windows_found}")
+        print(f"  - 筛选率: {total_cough_windows_found / max(total_windows_checked, 1) * 100:.2f}%")
+        print("=" * 60 + "\n")
+        
+        self.logger(f"Total samples: {total_samples}", level=1)
+        self.logger(f"Total windows checked: {total_windows_checked}", level=1)
+        self.logger(f"Cough windows found: {total_cough_windows_found}", level=1)
+        self.logger(f"Selection rate: {total_cough_windows_found / max(total_windows_checked, 1) * 100:.2f}%", level=1)
+        
+        if len(filtered_segments) == 0:
+            print("[WARNING] 没有找到任何符合条件的 Cough 片段！将使用原始数据集。")
+            self.logger("WARNING: No cough segments found! Using original dataset.", level=1)
+            return None
+        
+        # 创建筛选后的数据集
+        filtered_dataset = FilteredCoughSegmentDataset(
+            segments=filtered_segments,
+            data_dir=self.args.data_dir
+        )
+        
+        return filtered_dataset
+    
     def train_stage2(self):
         """
         Stage 2: 分类器重训练 + 动态蒸馏
@@ -277,6 +476,33 @@ class CrossDomainAudioTrainer:
         
         if self.best_model is not None:
             self.model.load_state_dict(self.best_model)
+        
+        # ===== 滑动窗口预处理：筛选 Cough 片段 =====
+        filtered_target_dataset = None
+        if getattr(self.args, 'use_sliding_window_filter', False):
+            # 使用滑动窗口筛选
+            confidence_threshold = getattr(self.args, 'filter_confidence_threshold', 0.95)
+            filtered_target_dataset = self._preprocess_target_data_with_sliding_window(confidence_threshold)
+            
+            if filtered_target_dataset is not None:
+                # 使用筛选后的数据集
+                # 注意：如果筛选后的数据很少，不要 drop_last，以免没有数据可训练
+                use_drop_last = len(filtered_target_dataset) >= self.args.batch_size
+                
+                self.target_unlabeled_loader = data.DataLoader(
+                    filtered_target_dataset,
+                    batch_size=min(self.args.batch_size, len(filtered_target_dataset)),  # 防止 batch_size 大于数据量
+                    shuffle=True,
+                    num_workers=self.args.workers,
+                    pin_memory=True,
+                    drop_last=use_drop_last
+                )
+                print(f"[INFO] 使用筛选后的数据集，包含 {len(filtered_target_dataset)} 个 Cough 片段")
+                if not use_drop_last:
+                    print(f"[WARNING] 筛选后数据较少，已禁用 drop_last 以保留所有数据")
+                self.logger(f"Using filtered dataset with {len(filtered_target_dataset)} cough segments", level=1)
+                if not use_drop_last:
+                    self.logger("WARNING: Filtered data is small, disabled drop_last", level=1)
         
         self.model.switch_to_stage2()
         
@@ -472,6 +698,17 @@ class CrossDomainAudioTrainer:
                     'acc': f'{total_acc / num_batches:.4f}'
                 })
             
+            # 防止除以零
+            if num_batches == 0:
+                print("[WARNING] No batches were processed. Returning zero losses.")
+                return {
+                    'total_loss': 0.0, 
+                    'ce_loss': 0.0, 
+                    'distill_loss': 0.0, 
+                    'source_loss': 0.0,
+                    'train_acc': 0.0
+                }
+            
             return {
                 'total_loss': total_loss / num_batches, 
                 'ce_loss': total_ce_loss / num_batches, 
@@ -525,6 +762,17 @@ class CrossDomainAudioTrainer:
                     'total_loss': f'{total_loss / num_batches:.4f}', 
                     'acc': f'{total_acc / num_batches:.4f}'
                 })
+            
+            # 防止除以零
+            if num_batches == 0:
+                print("[WARNING] No batches were processed. Returning zero losses.")
+                return {
+                    'total_loss': 0.0, 
+                    'ce_loss': 0.0, 
+                    'distill_loss': 0.0,
+                    'source_loss': 0.0,
+                    'train_acc': 0.0
+                }
             
             return {
                 'total_loss': total_loss / num_batches, 
@@ -905,10 +1153,62 @@ class CrossDomainAudioTrainer:
         # 记录消融实验配置
         self.log_ablation_config()
         
-        self.train_stage1()
+        # 检查是否跳过 Stage 1
+        if getattr(self.args, 'skip_stage1', False):
+            print("\n" + "=" * 50)
+            print("SKIPPING STAGE 1 TRAINING")
+            print("=" * 50)
+            
+            # 确定要加载的 Stage 1 模型路径
+            stage1_model_path = self._get_stage1_model_path()
+            
+            if stage1_model_path and os.path.exists(stage1_model_path):
+                print(f"Loading Stage 1 model from: {stage1_model_path}")
+                checkpoint = torch.load(stage1_model_path)
+                
+                # 尝试加载模型，使用 strict=False 以忽略不匹配的键
+                missing_keys, unexpected_keys = self.model.load_state_dict(checkpoint, strict=False)
+                
+                if missing_keys:
+                    print(f"Warning: Missing keys in checkpoint: {len(missing_keys)} keys")
+                if unexpected_keys:
+                    print(f"Warning: Unexpected keys in checkpoint: {len(unexpected_keys)} keys (ignored)")
+                
+                self.best_model = copy.deepcopy(self.model.state_dict())
+                print("Stage 1 model loaded successfully!\n")
+            else:
+                print(f"ERROR: Stage 1 model not found at {stage1_model_path}")
+                print("Please specify a valid --stage1_model_path or train Stage 1 first.")
+                return
+        else:
+            self.train_stage1()
+        
         self.train_stage2()
         
         print("=" * 50)
         print("Training Complete!")
         print(f"Best Target Domain Macro F1: {self.best_macro_f1:.4f}")
         print("=" * 50)
+    
+    def _get_stage1_model_path(self):
+        """
+        获取 Stage 1 模型路径
+        优先级：
+        1. 用户指定的 --stage1_model_path
+        2. 最新的 output/cold_zone_to_hot_zone_*/best_model_stage1_audio.pth
+        """
+        # 如果用户指定了路径，直接使用
+        if hasattr(self.args, 'stage1_model_path') and self.args.stage1_model_path:
+            return self.args.stage1_model_path
+        
+        # 否则查找最新的训练输出目录
+        import glob
+        pattern = f"output/{self.args.source_domain}_to_{self.args.target_domain}_*/best_model_stage1_audio.pth"
+        matching_paths = glob.glob(pattern)
+        
+        if matching_paths:
+            # 按修改时间排序，选择最新的
+            latest_model = max(matching_paths, key=os.path.getmtime)
+            return latest_model
+        
+        return None

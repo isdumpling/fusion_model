@@ -9,7 +9,99 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 
 TARGET_LENGTH = 64  
-N_MELS = 96  
+N_MELS = 96
+
+
+class FilteredCoughSegmentDataset(Dataset):
+    """
+    筛选后的 Cough 片段数据集
+    包含通过 Stage 1 模型滑动窗口筛选出的高置信度 cough 片段
+    """
+    def __init__(self, segments, data_dir, transform=None, target_length=TARGET_LENGTH, n_mels=N_MELS):
+        """
+        Args:
+            segments: List[Dict] - 每个元素包含 {'file_path', 'label', 'start_frame', 'end_frame', 'confidence'}
+            data_dir: 数据根目录
+            transform: 数据变换
+            target_length: 目标长度（帧数）
+            n_mels: mel频谱的频率维度
+        """
+        self.segments = segments
+        self.data_dir = data_dir
+        self.transform = transform
+        self.target_length = target_length
+        self.n_mels = n_mels
+        
+        # 为兼容性，统计标签
+        self.targets = [seg['label'] for seg in segments]
+        self.img_num_list = [0] * 2  # 二分类
+        for label in self.targets:
+            self.img_num_list[label] += 1
+    
+    def __len__(self):
+        return len(self.segments)
+    
+    def __getitem__(self, idx):
+        segment = self.segments[idx]
+        audio_path = os.path.join(self.data_dir, segment['file_path'])
+        label = segment['label']
+        start_frame = segment['start_frame']
+        end_frame = segment['end_frame']
+        
+        try:
+            waveform, sample_rate = torchaudio.load(audio_path)
+        except Exception as e:
+            print(f"Error loading file {audio_path}: {e}")
+            return torch.zeros((1, self.n_mels, self.target_length)), label, idx, torch.zeros((1, self.target_length * 160))
+        
+        # 重采样到 16kHz
+        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+        waveform = resampler(waveform)
+        
+        # 转换为单声道
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+        
+        # 生成完整的 Mel 频谱图
+        mel_spectrogram_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=16000,
+            n_fft=400,
+            win_length=400,
+            hop_length=160,
+            n_mels=self.n_mels,
+            f_min=125,
+            f_max=7500
+        )
+        mel_spectrogram = mel_spectrogram_transform(waveform)
+        log_mel_spectrogram = torch.log(mel_spectrogram + 1e-9)
+        
+        # 提取指定的片段
+        segment_spec = log_mel_spectrogram[:, :, start_frame:end_frame]
+        
+        # 调整到目标长度
+        if segment_spec.shape[2] > self.target_length:
+            segment_spec = segment_spec[:, :, :self.target_length]
+        else:
+            padding = self.target_length - segment_spec.shape[2]
+            segment_spec = torch.nn.functional.pad(segment_spec, (0, padding))
+        
+        # 提取对应的波形片段
+        start_sample = start_frame * 160  # hop_length = 160
+        end_sample = end_frame * 160
+        waveform_segment = waveform[:, start_sample:end_sample]
+        
+        # 调整波形到目标长度
+        target_waveform_length = self.target_length * 160
+        if waveform_segment.shape[1] > target_waveform_length:
+            waveform_segment = waveform_segment[:, :target_waveform_length]
+        else:
+            padding = target_waveform_length - waveform_segment.shape[1]
+            waveform_segment = torch.nn.functional.pad(waveform_segment, (0, padding))
+        
+        if self.transform:
+            segment_spec = self.transform(segment_spec)
+        
+        return segment_spec, label, idx, waveform_segment  
 
 class AudioLongTailDataset(Dataset):
     def __init__(self, data_frame, data_dir, transform=None, target_length=TARGET_LENGTH, 

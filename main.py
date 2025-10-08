@@ -26,6 +26,13 @@ def parse_args():
                         type=str,
                         help='Path to the pretrained VGGish model')
     parser.add_argument('--cur_stage', default='stage1', type=str, help='Internal tracking of training stage')
+    
+    # --- Stage 1 模型控制 ---
+    parser.add_argument('--skip_stage1', action='store_true', default=False,
+                        help='Skip stage 1 training and load a pretrained stage 1 model')
+    parser.add_argument('--stage1_model_path', type=str, default=None,
+                        help='Path to stage 1 model. If not specified and skip_stage1 is True, '
+                             'will use the latest model from output/cold_zone_to_hot_zone_*/best_model_stage1_audio.pth')
 
     # --- Stage 1: 特征学习参数 (源域) ---
     parser.add_argument('--epochs', default=100, type=int, help='Number of total epochs for stage 1')
@@ -35,7 +42,7 @@ def parse_args():
                         help='Patience for early stopping in stage 1. Set to 0 to disable.')
 
     # --- Stage 2: 分类器微调和蒸馏参数 (源域+目标域) ---
-    parser.add_argument('--finetune_epoch', default=50, type=int, help='Number of total epochs for stage 2')
+    parser.add_argument('--finetune_epoch', default=30, type=int, help='Number of total epochs for stage 2')
     parser.add_argument('--finetune_lr', default=0.001, type=float, help='Learning rate for stage 2')
     parser.add_argument('--finetune_wd', default=1e-4, type=float, help='Weight decay for stage 2 optimizer')
 
@@ -50,8 +57,8 @@ def parse_args():
                         help='Apply center vector to teacher logits')
 
     # --- 滑动窗口测试参数 ---
-    parser.add_argument('--window_size', type=float, default=0.8, help='Sliding window size in seconds for testing')
-    parser.add_argument('--hop_size', type=float, default=0.5, help='Sliding window hop size in seconds for testing')
+    parser.add_argument('--window_size', type=float, default=0.64, help='Sliding window size in seconds for testing')
+    parser.add_argument('--hop_size', type=float, default=0.32, help='Sliding window hop size in seconds for testing')
 
     # --- 训练设置 ---
     parser.add_argument('--batch_size', default=16, type=int, help='Train batchsize')
@@ -93,11 +100,11 @@ def parse_args():
                              'combo5: ALl Enabled')
     
     # --- 课程学习参数 (Curriculum Learning for Stage 2) ---
-    parser.add_argument('--use_curriculum_learning', action='store_true', default=False,
+    parser.add_argument('--use_curriculum_learning', action='store_true', default=True,
                         help='Enable curriculum learning based on teacher model confidence')
-    parser.add_argument('--initial_confidence_threshold', type=float, default=0.98,
+    parser.add_argument('--initial_confidence_threshold', type=float, default=0.95,
                         help='Initial confidence threshold for curriculum learning')
-    parser.add_argument('--final_confidence_threshold', type=float, default=0.70,
+    parser.add_argument('--final_confidence_threshold', type=float, default=0.80,
                         help='Final confidence threshold for curriculum learning')
     
     # --- Stage 2 源域数据使用参数 ---
@@ -105,6 +112,22 @@ def parse_args():
                         help='Use source domain data in stage 2 (in addition to target domain data)')
     parser.add_argument('--source_target_ratio', type=float, default=1.0,
                         help='Ratio of source to target batches in stage 2 when use_source_in_stage2 is enabled')
+    
+    # --- Stage 2 滑动窗口筛选参数 ---
+    parser.add_argument('--use_sliding_window_filter', action='store_true', default=False,
+                        help='Filter target domain training data using sliding window before stage 2')
+    parser.add_argument('--filter_confidence_threshold', type=float, default=0.75,
+                        help='Confidence threshold for filtering cough segments (default: 0.75, lenient for cross-domain)')
+    parser.add_argument('--filter_window_size', type=float, default=0.8,
+                        help='Window size in seconds for filtering (default: 0.8s, must be > 0.64s for sliding)')
+    parser.add_argument('--filter_hop_size', type=float, default=0.4,
+                        help='Hop size in seconds for filtering (default: 0.4s, 50% overlap)')
+    parser.add_argument('--filter_use_silence_removal', action='store_true', default=True,
+                        help='Use silence removal in filtering')
+    parser.add_argument('--no_filter_silence_removal', dest='filter_use_silence_removal', action='store_false',
+                        help='Disable silence removal in filtering')
+    parser.add_argument('--filter_silence_top_db', type=float, default=30,
+                        help='Silence threshold in dB for filtering (higher = more lenient, default: 30)')
 
     args = parser.parse_args()
     
@@ -192,6 +215,9 @@ def main():
     print("\n" + "="*60)
     print("ABLATION EXPERIMENT CONFIGURATION")
     print("="*60)
+    print(f"Skip Stage 1: {'YES' if args.skip_stage1 else 'NO'}")
+    if args.skip_stage1:
+        print(f"  - Stage 1 Model Path: {args.stage1_model_path if args.stage1_model_path else 'Auto (latest from output/)'}")
     print(f"WeightedRandomSampler: {'ENABLED' if args.use_weighted_sampler else 'DISABLED'}")
     print(f"Focal Loss: {'ENABLED' if args.use_focal_loss else 'DISABLED'}")
     if args.use_focal_loss:
@@ -203,6 +229,9 @@ def main():
     print(f"Stage 2 Use Source Data: {'ENABLED' if args.use_source_in_stage2 else 'DISABLED'}")
     if args.use_source_in_stage2:
         print(f"  - Source/Target Ratio: {args.source_target_ratio}")
+    print(f"Stage 2 Sliding Window Filter: {'ENABLED' if args.use_sliding_window_filter else 'DISABLED'}")
+    if args.use_sliding_window_filter:
+        print(f"  - Confidence Threshold: {args.filter_confidence_threshold}")
     print("="*60 + "\n")
 
     # 实例化训练器
