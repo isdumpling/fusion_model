@@ -78,6 +78,7 @@ class AudioDistillLOSSystem(nn.Module):
         
         # 冻结教师模型的所有参数
         self.teacher.requires_grad_(False)
+        self.teacher.eval()
         print("Teacher model created and frozen.")
     
     def forward(self, x):
@@ -126,6 +127,10 @@ class AudioDistillLOSSystem(nn.Module):
     def compute_stage2_loss(self, batch_unlabeled):
         """
         Stage 2: 仅使用目标域数据进行自我蒸馏和伪标签学习
+        改进：
+        1. 仅对高置信伪标签计算CE（避免低置信伪标签污染）
+        2. 使用构建的长尾损失（self.loss_function）而非原始CE
+        3. 蒸馏使用温度T，并乘以T^2进行缩放
         """
         (x_u_weak, x_u_strong), *_ = batch_unlabeled
         
@@ -134,18 +139,26 @@ class AudioDistillLOSSystem(nn.Module):
             teacher_scores = self.teacher(x_u_weak)
             teacher_probs = F.softmax(teacher_scores, dim=-1)
             # 创建硬伪标签用于额外的监督损失
-            pseudo_labels = torch.argmax(teacher_scores, dim=1)
+            pseudo_labels = teacher_probs.argmax(dim=1)
+            max_conf = teacher_probs.max(dim=1).values
 
         # 学生模型处理强增强数据
         student_scores = self.student(x_u_strong)
         
-        # 1. 监督损失：使用教师的硬伪标签
-        #    这提供了一个非常强的梯度信号
-        loss_ce = F.cross_entropy(student_scores, pseudo_labels)
+        # 1. 监督损失：只对高置信度样本计算"监督式"CE（阈值可配置）
+        tau = getattr(self.hparams, 'stage2_ce_conf_thresh', 0.6)
+        mask = max_conf >= tau
+        if mask.any():
+            # 用构造的长尾损失，自动支持 Focal / LogitAdj / class weights
+            loss_ce = self.loss_function(student_scores[mask], pseudo_labels[mask])
+        else:
+            loss_ce = torch.zeros((), device=student_scores.device)
 
-        # 2. 蒸馏损失：使用教师的软标签（概率分布）
-        student_log_probs = F.log_softmax(student_scores, dim=-1)
-        distill_loss = F.kl_div(student_log_probs, teacher_probs.detach(), reduction='batchmean')
+        # 2. 蒸馏损失：使用温度T，并乘以T^2
+        T = getattr(self.hparams, 'distill_temperature', 2.0)
+        student_log_probs = F.log_softmax(student_scores / T, dim=-1)
+        teacher_soft = F.softmax(teacher_scores / T, dim=-1)
+        distill_loss = F.kl_div(student_log_probs, teacher_soft.detach(), reduction='batchmean') * (T * T)
         
         # 总损失：结合两种损失
         distill_weight = getattr(self.hparams, 'distill_weight', 1.0)
@@ -155,11 +168,15 @@ class AudioDistillLOSSystem(nn.Module):
         train_acc = accuracy(student_scores.argmax(dim=-1), pseudo_labels, 
                            task='multiclass', num_classes=self.num_classes)
         
+        # 额外监控信息
+        high_conf_ratio = mask.float().mean().item()
+        
         return {
             'loss': total_loss,
             'loss_ce': loss_ce,
             'loss_distill': distill_loss,
             'train_acc': train_acc,
+            'high_conf_ratio': high_conf_ratio,
             'stage': 'stage2'
         }
     
@@ -216,16 +233,22 @@ class AudioDistillLOSSystem(nn.Module):
     
     def freeze_backbone_for_stage2(self):
         """
-        Stage 2阶段：冻结特征提取器，只训练分类器
-        这是LOS方法的核心策略
+        Stage 2阶段：冻结早期卷积层，解冻后端嵌入层和分类器
+        改进：只冻结features，解冻embeddings和head，以适应跨域场景
         """
-        for param in self.feature_extractor.parameters():
-            param.requires_grad = False
+        # 冻住早期卷积
+        for p in self.feature_extractor.features.parameters():
+            p.requires_grad = False
         
-        for param in self.classifier.parameters():
-            param.requires_grad = True
+        # 解冻后端非线性嵌入层 + 分类头
+        if hasattr(self.feature_extractor, 'embeddings') and self.feature_extractor.embeddings is not None:
+            for p in self.feature_extractor.embeddings.parameters():
+                p.requires_grad = True
+        
+        for p in self.classifier.parameters():
+            p.requires_grad = True
             
-        print("Backbone frozen, only classifier will be trained in Stage 2.")
+        print("Stage2: features frozen; embeddings + head unfrozen.")
     
     def unfreeze_all(self):
         """解冻所有参数"""
@@ -234,11 +257,10 @@ class AudioDistillLOSSystem(nn.Module):
         print("All parameters unfrozen.")
     
     def get_stage2_optimizer(self, lr=0.01, weight_decay=1e-4):
-        """
-        获取Stage 2优化器 - 只优化分类器参数
-        """
+        params = [p for p in self.parameters() if p.requires_grad]
+
         return torch.optim.SGD(
-            self.classifier.parameters(),
+            params,
             lr=lr,
             momentum=0.9,
             weight_decay=weight_decay

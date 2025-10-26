@@ -16,7 +16,7 @@ def parse_args():
     # --- 数据集和路径 ---
     parser.add_argument('--data_dir', default='data/', help='Root directory of datasets')
     parser.add_argument('--source_domain', default='cold_zone', help='Folder name of the source domain dataset')
-    parser.add_argument('--target_domain', default='hot_zone', help='Folder name of the target domain dataset')
+    parser.add_argument('--target_domain', default='hot_zone_fine', help='Folder name of the target domain dataset')
     parser.add_argument('--out', default='output', help='Directory to output the results')
 
     # --- 模型和任务 ---
@@ -55,6 +55,18 @@ def parse_args():
     parser.add_argument('--center_momentum', default=0.9, type=float, help='EMA momentum for the center vector')
     parser.add_argument('--apply_center', action='store_true', default=False,
                         help='Apply center vector to teacher logits')
+    parser.add_argument('--stage2_ce_conf_thresh', type=float, default=0.6,
+                        help='Min confidence to use hard pseudo labels for CE in Stage2')
+    parser.add_argument('--distill_temperature', type=float, default=2.0,
+                        help='Temperature for KL distillation in Stage2')
+    
+    # --- Teacher EMA Warm-up 参数 ---
+    parser.add_argument('--teacher_ema_warmup', type=int, default=5,
+                        help='Number of epochs to wait before starting teacher EMA updates (default: 5)')
+    parser.add_argument('--distill_weight_high', type=float, default=1.0,
+                        help='High distillation weight during warm-up period (default: 1.0)')
+    parser.add_argument('--distill_weight_low', type=float, default=0.3,
+                        help='Low distillation weight after warm-up period (default: 0.3)')
 
     # --- 滑动窗口测试参数 ---
     parser.add_argument('--window_size', type=float, default=0.64, help='Sliding window size in seconds for testing')
@@ -128,6 +140,10 @@ def parse_args():
                         help='Disable silence removal in filtering')
     parser.add_argument('--filter_silence_top_db', type=float, default=30,
                         help='Silence threshold in dB for filtering (higher = more lenient, default: 30)')
+    parser.add_argument('--filter_keep_negatives', action='store_true', default=True,
+                        help='Keep high-confidence negative samples in filtering')
+    parser.add_argument('--filter_neg_conf_threshold', type=float, default=None,
+                        help='Confidence threshold for filtering negative samples (default: filter_confidence_threshold + 0.05)')
 
     args = parser.parse_args()
     

@@ -19,6 +19,9 @@ from audio_distill_los_system import AudioDistillLOSSystem
 from utils.common import hms_string, calculate_flops
 from utils.logger import logger
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 class CrossDomainAudioTrainer:
     """
@@ -44,6 +47,10 @@ class CrossDomainAudioTrainer:
             self.early_stopping_patience = float('inf')
         self.patience_counter = 0
         self.best_val_loss = float('inf')
+
+        # F1 score tracking for plots
+        self.stage1_f1_scores = []
+        self.stage2_f1_scores = []
 
         # 数据加载
         self.setup_data()
@@ -233,6 +240,8 @@ class CrossDomainAudioTrainer:
             # Stage 1: 使用源域测试集进行验证，不使用滑动窗口
             test_loss, test_acc, test_cls, micro_f1, macro_f1, class_metrics = self._validate_stage1(self.source_testloader)
 
+            self.stage1_f1_scores.append(macro_f1)
+
             lr = scheduler.get_last_lr()[0]
             scheduler.step()
             
@@ -261,6 +270,8 @@ class CrossDomainAudioTrainer:
         
         self._save_model("best_model_stage1_audio.pth")
         
+        self._plot_f1_scores(self.stage1_f1_scores, "stage1")
+
         self.logger(f'Stage 1 Training Time: {hms_string(end_time - start_time)}', level=1)
         self.logger(f'Stage 1 Best Macro F1: {self.best_macro_f1:.4f}', level=1)
         
@@ -327,6 +338,13 @@ class CrossDomainAudioTrainer:
         total_samples = len(preprocess_dataset)
         total_windows_checked = 0
         total_cough_windows_found = 0
+        total_neg_windows_found = 0
+        
+        # 配置是否保留高置信负样本
+        keep_negs = getattr(self.args, 'filter_keep_negatives', True)
+        neg_tau = getattr(self.args, 'filter_neg_conf_threshold', None)
+        if neg_tau is None:
+            neg_tau = confidence_threshold + 0.05
         
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(temp_loader, desc="筛选 Cough 片段")):
@@ -397,16 +415,21 @@ class CrossDomainAudioTrainer:
                         
                         total_windows_checked += 1
                         
-                        # 如果预测为 cough (label 0) 且置信度足够高
-                        if predicted_class == 0 and confidence >= confidence_threshold:
+                        # 保留高置信度窗口：正样本（cough）或负样本（非cough）
+                        if ((predicted_class == 0 and confidence >= confidence_threshold) or
+                            (keep_negs and predicted_class == 1 and confidence >= neg_tau)):
                             filtered_segments.append({
                                 'file_path': file_path,
                                 'label': true_label,
                                 'start_frame': start_frame + event_start,
                                 'end_frame': start_frame + event_start + model_input_frames,
-                                'confidence': confidence
+                                'confidence': confidence,
+                                'predicted_class': predicted_class
                             })
-                            total_cough_windows_found += 1
+                            if predicted_class == 0:
+                                total_cough_windows_found += 1
+                            else:
+                                total_neg_windows_found += 1
                         
                         event_start += scan_hop
                     
@@ -424,28 +447,40 @@ class CrossDomainAudioTrainer:
                             
                             total_windows_checked += 1
                             
-                            if predicted_class == 0 and confidence >= confidence_threshold:
+                            # 保留高置信度窗口：正样本（cough）或负样本（非cough）
+                            if ((predicted_class == 0 and confidence >= confidence_threshold) or
+                                (keep_negs and predicted_class == 1 and confidence >= neg_tau)):
                                 filtered_segments.append({
                                     'file_path': file_path,
                                     'label': true_label,
                                     'start_frame': start_frame + last_start,
                                     'end_frame': start_frame + last_start + model_input_frames,
-                                    'confidence': confidence
+                                    'confidence': confidence,
+                                    'predicted_class': predicted_class
                                 })
-                                total_cough_windows_found += 1
+                                if predicted_class == 0:
+                                    total_cough_windows_found += 1
+                                else:
+                                    total_neg_windows_found += 1
         
         print("=" * 60)
         print(f"筛选完成:")
         print(f"  - 总样本数: {total_samples}")
         print(f"  - 检查的窗口总数: {total_windows_checked}")
         print(f"  - 找到的 Cough 窗口数: {total_cough_windows_found}")
-        print(f"  - 筛选率: {total_cough_windows_found / max(total_windows_checked, 1) * 100:.2f}%")
+        if keep_negs:
+            print(f"  - 找到的高置信负样本窗口数: {total_neg_windows_found}")
+        print(f"  - 总保留窗口数: {total_cough_windows_found + total_neg_windows_found}")
+        print(f"  - 筛选率: {(total_cough_windows_found + total_neg_windows_found) / max(total_windows_checked, 1) * 100:.2f}%")
         print("=" * 60 + "\n")
         
         self.logger(f"Total samples: {total_samples}", level=1)
         self.logger(f"Total windows checked: {total_windows_checked}", level=1)
         self.logger(f"Cough windows found: {total_cough_windows_found}", level=1)
-        self.logger(f"Selection rate: {total_cough_windows_found / max(total_windows_checked, 1) * 100:.2f}%", level=1)
+        if keep_negs:
+            self.logger(f"High-confidence negative windows found: {total_neg_windows_found}", level=1)
+        self.logger(f"Total kept windows: {total_cough_windows_found + total_neg_windows_found}", level=1)
+        self.logger(f"Selection rate: {(total_cough_windows_found + total_neg_windows_found) / max(total_windows_checked, 1) * 100:.2f}%", level=1)
         
         if len(filtered_segments) == 0:
             print("[WARNING] 没有找到任何符合条件的 Cough 片段！将使用原始数据集。")
@@ -511,6 +546,9 @@ class CrossDomainAudioTrainer:
         optimizer = self.model.get_stage2_optimizer(lr=self.args.finetune_lr, weight_decay=self.args.finetune_wd)
         scheduler = lr_scheduler.CosineAnnealingLR(optimizer, self.args.finetune_epoch, eta_min=0.0)
         
+        # ===== 确定课程学习使用的数据集（与训练使用同一份数据）=====
+        dataset_for_curriculum = filtered_target_dataset if filtered_target_dataset is not None else self.target_trainset
+        
         # ===== 课程学习：预计算所有目标域样本的伪标签和置信度 =====
         pseudo_label_info = None
         if self.args.use_curriculum_learning:
@@ -518,16 +556,36 @@ class CrossDomainAudioTrainer:
             print("Curriculum Learning Enabled - Precomputing Pseudo Labels")
             print("=" * 50)
             self.logger("Starting pseudo-label precomputation for curriculum learning...", level=1)
-            pseudo_label_info = self._precompute_pseudo_labels()
+            pseudo_label_info = self._precompute_pseudo_labels(dataset_for_curriculum)
             self.logger(f"Precomputed {len(pseudo_label_info)} samples with confidence scores", level=1)
             print("=" * 50 + "\n")
         
         start_time = time.time()
         
+        # ===== Teacher EMA Warm-up 参数 =====
+        warmup = getattr(self.args, 'teacher_ema_warmup', 5)
+        distill_weight_high = getattr(self.args, 'distill_weight_high', 1.0)
+        distill_weight_low = getattr(self.args, 'distill_weight_low', 0.3)
+        
+        print("\n" + "=" * 50)
+        print("Teacher EMA Warm-up Configuration:")
+        print(f"  - Warm-up epochs: {warmup}")
+        print(f"  - Distillation weight (high): {distill_weight_high}")
+        print(f"  - Distillation weight (low): {distill_weight_low}")
+        print("=" * 50 + "\n")
+        
         for epoch in range(self.args.finetune_epoch):
+            # ===== 蒸馏权重动态调整 =====
+            if epoch + 1 <= warmup:
+                self.model.hparams.distill_weight = distill_weight_high
+                print(f"Epoch {epoch + 1}/{self.args.finetune_epoch}: Using HIGH distillation weight ({distill_weight_high})")
+            else:
+                self.model.hparams.distill_weight = distill_weight_low
+                print(f"Epoch {epoch + 1}/{self.args.finetune_epoch}: Using LOW distillation weight ({distill_weight_low})")
+            
             # ===== 课程学习：动态筛选数据 =====
             current_target_loader = self.target_unlabeled_loader  # 默认使用所有数据
-            num_selected_samples = len(self.target_trainset)
+            num_selected_samples = len(dataset_for_curriculum)
             
             if self.args.use_curriculum_learning and pseudo_label_info is not None:
                 # 计算当前epoch的置信度阈值（线性衰减）
@@ -542,14 +600,14 @@ class CrossDomainAudioTrainer:
                 selected_indices = [idx for idx, conf in pseudo_label_info if conf >= current_threshold]
                 num_selected_samples = len(selected_indices)
                 
-                # 创建包含筛选样本的数据加载器
+                # 创建包含筛选样本的数据加载器（使用与训练相同的数据集）
                 if num_selected_samples > 0:
                     current_target_loader = self._create_filtered_loader(
-                        self.target_trainset,
+                        dataset_for_curriculum,
                         selected_indices,
                         self.args.batch_size
                     )
-                    self.logger(f"Epoch {epoch + 1}/{self.args.finetune_epoch}: Using {num_selected_samples}/{len(self.target_trainset)} target samples (threshold={current_threshold:.4f})", level=1)
+                    self.logger(f"Epoch {epoch + 1}/{self.args.finetune_epoch}: Using {num_selected_samples}/{len(dataset_for_curriculum)} target samples (threshold={current_threshold:.4f})", level=1)
                 else:
                     # 如果没有样本满足阈值，使用全部数据
                     self.logger(f"Epoch {epoch + 1}/{self.args.finetune_epoch}: No samples meet threshold {current_threshold:.4f}, using all samples", level=1)
@@ -560,10 +618,19 @@ class CrossDomainAudioTrainer:
             # Stage 2: 使用目标域测试集进行验证，使用滑动窗口
             test_loss, test_acc, test_cls, micro_f1, macro_f1, class_metrics = self._validate_stage2_sliding_window(self.target_testloader)
 
+            self.stage2_f1_scores.append(macro_f1)
+
             lr = scheduler.get_last_lr()[0]
             scheduler.step()
             
-            self.model.update_teacher_ema()
+            # ===== Teacher EMA Warm-up 控制 =====
+            if epoch + 1 > warmup:
+                self.model.update_teacher_ema()
+                if epoch + 1 == warmup + 1:
+                    print(f"\n[Epoch {epoch + 1}] Teacher EMA warm-up完成，开始更新Teacher模型\n")
+            else:
+                if epoch == 0:
+                    print(f"\n[Epoch {epoch + 1}] Teacher EMA warm-up期间，暂停Teacher模型更新\n")
             
             if macro_f1 > self.best_macro_f1:
                 self.best_macro_f1 = macro_f1
@@ -577,6 +644,8 @@ class CrossDomainAudioTrainer:
         end_time = time.time()
         
         self._save_model("best_model_stage2_audio.pth")
+        
+        self._plot_f1_scores(self.stage2_f1_scores, "stage2")
         
         self.logger(f'Stage 2 Training Time: {hms_string(end_time - start_time)}', level=1)
         self.logger(f'Stage 2 Best Target Macro F1: {self.best_macro_f1:.4f}', level=1)
@@ -782,10 +851,13 @@ class CrossDomainAudioTrainer:
                 'train_acc': total_acc / num_batches
             }
     
-    def _precompute_pseudo_labels(self):
+    def _precompute_pseudo_labels(self, dataset):
         """
         预计算所有目标域训练数据的伪标签和置信度
         使用当前的教师模型（即Stage 1训练的最佳模型）进行预测
+        
+        Args:
+            dataset: 用于预计算的数据集（可以是原始数据集或滑窗过滤后的数据集）
         
         Returns:
             List[Tuple[int, float]]: 列表包含 (样本索引, 置信度) 元组
@@ -795,7 +867,7 @@ class CrossDomainAudioTrainer:
         
         # 创建一个不打乱的数据加载器，用于预计算
         precompute_loader = data.DataLoader(
-            self.target_trainset,
+            dataset,
             batch_size=self.args.batch_size,
             shuffle=False,  # 不打乱，保持索引对应
             num_workers=self.args.workers,
@@ -855,31 +927,18 @@ class CrossDomainAudioTrainer:
         return current_threshold
     
     def _create_filtered_loader(self, dataset, selected_indices, batch_size):
-        """
-        创建一个只包含选定样本的数据加载器
-        
-        Args:
-            dataset: 完整的数据集
-            selected_indices: 选中的样本索引列表
-            batch_size: 批次大小
-            
-        Returns:
-            DataLoader: 筛选后的数据加载器
-        """
-        # 使用Subset创建子数据集
         subset = data.Subset(dataset, selected_indices)
-        
-        # 创建数据加载器
-        filtered_loader = data.DataLoader(
+        use_drop_last = len(selected_indices) >= batch_size
+        eff_bs = min(batch_size, len(selected_indices)) if len(selected_indices) > 0 else 1
+        return data.DataLoader(
             subset,
-            batch_size=batch_size,
-            shuffle=True,  # 打乱选中的样本
+            batch_size=eff_bs,
+            shuffle=True,
             num_workers=self.args.workers,
             pin_memory=True,
-            drop_last=True  # 与原始loader保持一致
+            drop_last=use_drop_last
         )
-        
-        return filtered_loader
+
     
     def _validate_stage1(self, testloader):
         """
@@ -1144,6 +1203,49 @@ class CrossDomainAudioTrainer:
             torch.save(self.best_model, file_path)
             self.logger(f'Model saved to {file_path}', level=1)
     
+    def _plot_f1_scores(self, f1_scores, stage_name):
+        """
+        绘制并保存 F1 分数曲线图
+        
+        Args:
+            f1_scores (list): 每个 epoch 的 Macro F1 分数列表
+            stage_name (str): 阶段名称 ('stage1' or 'stage2')
+        """
+        if not f1_scores:
+            self.logger(f"No F1 scores to plot for {stage_name}.", level=1)
+            return
+            
+        plt.figure(figsize=(10, 6))
+        epochs = range(1, len(f1_scores) + 1)
+        plt.plot(epochs, f1_scores, marker='o', linestyle='-', label=f'{stage_name.capitalize()} Macro F1')
+        
+        plt.title(f'{stage_name.capitalize()} Macro F1 Score Over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('Macro F1 Score')
+        plt.grid(True)
+        plt.legend()
+        
+        # 标注最佳F1分数
+        best_f1 = max(f1_scores)
+        best_epoch = f1_scores.index(best_f1) + 1
+        plt.annotate(f'Best F1: {best_f1:.4f} at Epoch {best_epoch}',
+                     xy=(best_epoch, best_f1),
+                     xytext=(best_epoch, best_f1 - 0.05 if best_f1 > 0.1 else best_f1 + 0.05),
+                     arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=8),
+                     horizontalalignment='center',
+                     verticalalignment='top' if best_f1 > 0.1 else 'bottom')
+        
+        plt.tight_layout()
+        
+        file_path = os.path.join(self.args.out, f'{stage_name}_macro_f1.png')
+        try:
+            plt.savefig(file_path)
+            self.logger(f'F1 score plot for {stage_name} saved to {file_path}', level=1)
+        except Exception as e:
+            self.logger(f"Error saving plot to {file_path}: {e}", level=1)
+        finally:
+            plt.close()
+
     def run_full_training(self):
         print("Starting Cross-Domain Audio Long-Tail Training")
         print(f"Source domain: {self.args.source_domain}")
