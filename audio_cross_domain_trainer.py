@@ -267,25 +267,13 @@ class CrossDomainAudioTrainer:
                 break
         
         end_time = time.time()
-        stage1_training_time = end_time - start_time
         
         self._save_model("best_model_stage1_audio.pth")
         
         self._plot_f1_scores(self.stage1_f1_scores, "stage1")
 
-        print("\n" + "=" * 60)
-        print("STAGE 1 训练完成")
-        print("=" * 60)
-        print(f"训练时间: {hms_string(stage1_training_time)}")
-        print(f"最佳 Macro F1: {self.best_macro_f1:.4f}")
-        print("=" * 60 + "\n")
-        
-        self.logger("=" * 60, level=1)
-        self.logger("STAGE 1 TRAINING COMPLETED", level=1)
-        self.logger("=" * 60, level=1)
-        self.logger(f'Stage 1 Training Time: {hms_string(stage1_training_time)}', level=1)
+        self.logger(f'Stage 1 Training Time: {hms_string(end_time - start_time)}', level=1)
         self.logger(f'Stage 1 Best Macro F1: {self.best_macro_f1:.4f}', level=1)
-        self.logger("=" * 60, level=1)
         
     def _preprocess_target_data_with_sliding_window(self, confidence_threshold=0.95):
         """
@@ -524,29 +512,6 @@ class CrossDomainAudioTrainer:
         if self.best_model is not None:
             self.model.load_state_dict(self.best_model)
         
-        # ===== 在Stage 2训练前，使用Stage 1模型对目标域进行测试 =====
-        print("\n" + "=" * 60)
-        print("Stage 1模型在目标域的初始性能评估")
-        print("=" * 60)
-        self.logger("Evaluating Stage 1 model on target domain before Stage 2 training...", level=1)
-        
-        test_loss, test_acc, test_cls, micro_f1, macro_f1, class_metrics = self._validate_stage2_sliding_window(self.target_testloader)
-        
-        self.logger("=" * 60, level=1)
-        self.logger("STAGE 1 MODEL - TARGET DOMAIN TEST RESULTS", level=1)
-        self.logger("=" * 60, level=1)
-        self.logger(f'[Test ]\tLoss:\t{test_loss:.4f}\tAcc:\t{test_acc:.4f}', level=1)
-        self.logger(f'[Test ]\tMicro F1:\t{micro_f1:.4f}\tMacro F1:\t{macro_f1:.4f}', level=1)
-        self.logger(f'[Cough   ]\tF1:\t{class_metrics["cough_f1"]:.4f}\tPrecision:\t{class_metrics["cough_precision"]:.4f}\tRecall:\t{class_metrics["cough_recall"]:.4f}', level=1)
-        self.logger(f'[NonCough]\tF1:\t{class_metrics["non_cough_f1"]:.4f}\tPrecision:\t{class_metrics["non_cough_precision"]:.4f}\tRecall:\t{class_metrics["non_cough_recall"]:.4f}', level=1)
-        if len(test_cls) >= 3:
-            self.logger(f'[Stats]\tMany:\t{test_cls[0]:.4f}\tMedium:\t{test_cls[1]:.4f}\tFew:\t{test_cls[2]:.4f}', level=1)
-        self.logger("=" * 60, level=1)
-        
-        print(f"Stage 1模型在目标域的Macro F1: {macro_f1:.4f}")
-        print(f"Cough F1: {class_metrics['cough_f1']:.4f}, Non-Cough F1: {class_metrics['non_cough_f1']:.4f}")
-        print("=" * 60 + "\n")
-        
         # ===== 滑动窗口预处理：筛选 Cough 片段 =====
         filtered_target_dataset = None
         if getattr(self.args, 'use_sliding_window_filter', False):
@@ -677,25 +642,13 @@ class CrossDomainAudioTrainer:
             self._log_stage2_epoch(epoch + 1, train_results, test_loss, test_acc, test_cls, lr, micro_f1, macro_f1, class_metrics)
 
         end_time = time.time()
-        stage2_training_time = end_time - start_time
         
         self._save_model("best_model_stage2_audio.pth")
         
         self._plot_f1_scores(self.stage2_f1_scores, "stage2")
         
-        print("\n" + "=" * 60)
-        print("STAGE 2 训练完成")
-        print("=" * 60)
-        print(f"训练时间: {hms_string(stage2_training_time)}")
-        print(f"最佳目标域 Macro F1: {self.best_macro_f1:.4f}")
-        print("=" * 60 + "\n")
-        
-        self.logger("=" * 60, level=1)
-        self.logger("STAGE 2 TRAINING COMPLETED", level=1)
-        self.logger("=" * 60, level=1)
-        self.logger(f'Stage 2 Training Time: {hms_string(stage2_training_time)}', level=1)
+        self.logger(f'Stage 2 Training Time: {hms_string(end_time - start_time)}', level=1)
         self.logger(f'Stage 2 Best Target Macro F1: {self.best_macro_f1:.4f}', level=1)
-        self.logger("=" * 60, level=1)
 
     def _train_stage1_epoch(self, optimizer):
         self.model.train()
@@ -1294,8 +1247,6 @@ class CrossDomainAudioTrainer:
             plt.close()
 
     def run_full_training(self):
-        overall_start_time = time.time()
-        
         print("Starting Cross-Domain Audio Long-Tail Training")
         print(f"Source domain: {self.args.source_domain}")
         print(f"Target domain: {self.args.target_domain}")
@@ -1303,9 +1254,6 @@ class CrossDomainAudioTrainer:
         
         # 记录消融实验配置
         self.log_ablation_config()
-        
-        stage1_time = 0
-        stage2_time = 0
         
         # 检查是否跳过 Stage 1
         if getattr(self.args, 'skip_stage1', False):
@@ -1335,36 +1283,14 @@ class CrossDomainAudioTrainer:
                 print("Please specify a valid --stage1_model_path or train Stage 1 first.")
                 return
         else:
-            stage1_start = time.time()
             self.train_stage1()
-            stage1_time = time.time() - stage1_start
         
-        stage2_start = time.time()
         self.train_stage2()
-        stage2_time = time.time() - stage2_start
         
-        overall_end_time = time.time()
-        total_training_time = overall_end_time - overall_start_time
-        
-        print("\n" + "=" * 60)
-        print("全部训练完成！")
-        print("=" * 60)
-        if not getattr(self.args, 'skip_stage1', False):
-            print(f"Stage 1 训练时间: {hms_string(stage1_time)}")
-        print(f"Stage 2 训练时间: {hms_string(stage2_time)}")
-        print(f"总训练时间: {hms_string(total_training_time)}")
-        print(f"最佳目标域 Macro F1: {self.best_macro_f1:.4f}")
-        print("=" * 60 + "\n")
-        
-        self.logger("=" * 60, level=1)
-        self.logger("TRAINING COMPLETED SUMMARY", level=1)
-        self.logger("=" * 60, level=1)
-        if not getattr(self.args, 'skip_stage1', False):
-            self.logger(f'Stage 1 Training Time: {hms_string(stage1_time)}', level=1)
-        self.logger(f'Stage 2 Training Time: {hms_string(stage2_time)}', level=1)
-        self.logger(f'Total Training Time: {hms_string(total_training_time)}', level=1)
-        self.logger(f'Best Target Domain Macro F1: {self.best_macro_f1:.4f}', level=1)
-        self.logger("=" * 60, level=1)
+        print("=" * 50)
+        print("Training Complete!")
+        print(f"Best Target Domain Macro F1: {self.best_macro_f1:.4f}")
+        print("=" * 50)
     
     def _get_stage1_model_path(self):
         """

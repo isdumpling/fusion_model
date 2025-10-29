@@ -63,7 +63,7 @@ def parse_args():
     # --- Teacher EMA Warm-up 参数 ---
     parser.add_argument('--teacher_ema_warmup', type=int, default=5,
                         help='Number of epochs to wait before starting teacher EMA updates (default: 5)')
-    parser.add_argument('--distill_weight_high', type=float, default=0.7,
+    parser.add_argument('--distill_weight_high', type=float, default=1.0,
                         help='High distillation weight during warm-up period (default: 1.0)')
     parser.add_argument('--distill_weight_low', type=float, default=0.3,
                         help='Low distillation weight after warm-up period (default: 0.3)')
@@ -114,21 +114,21 @@ def parse_args():
     # --- 课程学习参数 (Curriculum Learning for Stage 2) ---
     parser.add_argument('--use_curriculum_learning', action='store_true', default=True,
                         help='Enable curriculum learning based on teacher model confidence')
-    parser.add_argument('--initial_confidence_threshold', type=float, default=0.85,
+    parser.add_argument('--initial_confidence_threshold', type=float, default=0.95,
                         help='Initial confidence threshold for curriculum learning')
-    parser.add_argument('--final_confidence_threshold', type=float, default=0.85,
+    parser.add_argument('--final_confidence_threshold', type=float, default=0.80,
                         help='Final confidence threshold for curriculum learning')
     
     # --- Stage 2 源域数据使用参数 ---
-    parser.add_argument('--use_source_in_stage2', action='store_true', default=True,
+    parser.add_argument('--use_source_in_stage2', action='store_true', default=False,
                         help='Use source domain data in stage 2 (in addition to target domain data)')
-    parser.add_argument('--source_target_ratio', type=float, default=2.0,
+    parser.add_argument('--source_target_ratio', type=float, default=1.0,
                         help='Ratio of source to target batches in stage 2 when use_source_in_stage2 is enabled')
     
     # --- Stage 2 滑动窗口筛选参数 ---
-    parser.add_argument('--use_sliding_window_filter', action='store_true', default=True,
+    parser.add_argument('--use_sliding_window_filter', action='store_true', default=False,
                         help='Filter target domain training data using sliding window before stage 2')
-    parser.add_argument('--filter_confidence_threshold', type=float, default=0.65,
+    parser.add_argument('--filter_confidence_threshold', type=float, default=0.75,
                         help='Confidence threshold for filtering cough segments (default: 0.75, lenient for cross-domain)')
     parser.add_argument('--filter_window_size', type=float, default=0.8,
                         help='Window size in seconds for filtering (default: 0.8s, must be > 0.64s for sliding)')
@@ -142,7 +142,7 @@ def parse_args():
                         help='Silence threshold in dB for filtering (higher = more lenient, default: 30)')
     parser.add_argument('--filter_keep_negatives', action='store_true', default=True,
                         help='Keep high-confidence negative samples in filtering')
-    parser.add_argument('--filter_neg_conf_threshold', type=float, default=0.70,
+    parser.add_argument('--filter_neg_conf_threshold', type=float, default=None,
                         help='Confidence threshold for filtering negative samples (default: filter_confidence_threshold + 0.05)')
 
     args = parser.parse_args()
