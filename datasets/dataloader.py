@@ -162,41 +162,25 @@ class AudioLongTailDataset(Dataset):
         mel_spectrogram = mel_spectrogram_transform(waveform)
         log_mel_spectrogram = torch.log(mel_spectrogram + 1e-9)
 
-        # 数据长度处理逻辑
-        if self.mode == 'train':
-            # 训练模式：总是调整到固定长度
-            if log_mel_spectrogram.shape[2] > self.target_length:
-                log_mel_spectrogram = log_mel_spectrogram[:, :, :self.target_length]
-            else:
-                padding = self.target_length - log_mel_spectrogram.shape[2]
-                log_mel_spectrogram = torch.nn.functional.pad(log_mel_spectrogram, (0, padding))
+        # 数据长度处理逻辑：统一调整到固定长度
+        if log_mel_spectrogram.shape[2] > self.target_length:
+            log_mel_spectrogram = log_mel_spectrogram[:, :, :self.target_length]
         else:
-            # 测试模式
-            if self.domain == 'source':
-                # Stage 1 源域测试：调整到固定长度（与训练一致）
-                if log_mel_spectrogram.shape[2] > self.target_length:
-                    log_mel_spectrogram = log_mel_spectrogram[:, :, :self.target_length]
-                else:
-                    padding = self.target_length - log_mel_spectrogram.shape[2]
-                    log_mel_spectrogram = torch.nn.functional.pad(log_mel_spectrogram, (0, padding))
-            else:
-                # Stage 2 目标域测试：保持原始长度（用于滑动窗口）
-                pass  # 不做任何长度调整
+            padding = self.target_length - log_mel_spectrogram.shape[2]
+            log_mel_spectrogram = torch.nn.functional.pad(log_mel_spectrogram, (0, padding))
 
         if self.transform:
             log_mel_spectrogram = self.transform(log_mel_spectrogram)
 
-        # 目标域：总是返回 waveform（用于 Stage 2 的强增强和测试时的静音检测）
+        # 目标域：总是返回 waveform（用于 Stage 2 的强增强）
         if self.domain == 'target':
-            # 训练模式：确保 waveform 长度一致以便 batch 化
-            if self.mode == 'train':
-                target_waveform_length = self.target_length * 160  # 160 是 hop_length
-                if waveform.shape[1] > target_waveform_length:
-                    waveform = waveform[:, :target_waveform_length]
-                else:
-                    padding = target_waveform_length - waveform.shape[1]
-                    waveform = torch.nn.functional.pad(waveform, (0, padding))
-            # 测试模式：保持原始长度（用于滑动窗口）
+            # 统一调整 waveform 长度以便 batch 化
+            target_waveform_length = self.target_length * 160  # 160 是 hop_length
+            if waveform.shape[1] > target_waveform_length:
+                waveform = waveform[:, :target_waveform_length]
+            else:
+                padding = target_waveform_length - waveform.shape[1]
+                waveform = torch.nn.functional.pad(waveform, (0, padding))
             
             return log_mel_spectrogram, label, idx, waveform
         
