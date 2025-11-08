@@ -386,7 +386,7 @@ class CrossDomainAudioTrainer:
             # 使用动态数据加载器进行训练
             train_results = self._train_stage2_epoch(optimizer, current_target_loader, num_selected_samples)
             
-            # Stage 2: 使用目标域测试集进行验证，使用滑动窗口
+            # Stage 2: 使用目标域测试集进行验证
             test_loss, test_acc, test_cls, micro_f1, macro_f1, class_metrics = self._validate_stage1(self.target_testloader)
 
             self.stage2_f1_scores.append(macro_f1)
@@ -628,7 +628,7 @@ class CrossDomainAudioTrainer:
         使用当前的教师模型（即Stage 1训练的最佳模型）进行预测
         
         Args:
-            dataset: 用于预计算的数据集（可以是原始数据集或滑窗过滤后的数据集）
+            dataset: 用于预计算的数据集
         
         Returns:
             List[Tuple[int, float]]: 列表包含 (样本索引, 置信度) 元组

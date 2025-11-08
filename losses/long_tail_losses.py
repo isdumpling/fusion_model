@@ -44,7 +44,7 @@ class FocalLoss(nn.Module):
                 alpha_t = self.alpha
             else:
                 # alpha is a tensor of class weights
-                alpha_t = self.alpha[targets]
+                alpha_t = self.alpha.to(inputs.device)[targets]
             focal_weight = alpha_t * focal_weight
         
         # Apply focal weight to cross entropy loss
@@ -145,7 +145,7 @@ class CombinedLongTailLoss(nn.Module):
         else:
             # Standard cross entropy with optional label smoothing
             if self.label_smooth < 1.0:
-                self.loss_fn = nn.CrossEntropyLoss(label_smoothing=1.0 - self.label_smooth)
+                self.loss_fn = nn.CrossEntropyLoss(label_smoothing=self.label_smooth)
             else:
                 self.loss_fn = nn.CrossEntropyLoss()
     

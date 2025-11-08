@@ -43,11 +43,11 @@ def parse_args():
 
     # --- Stage 2: 分类器微调和蒸馏参数 (源域+目标域) ---
     parser.add_argument('--finetune_epoch', default=30, type=int, help='Number of total epochs for stage 2')
-    parser.add_argument('--finetune_lr', default=0.001, type=float, help='Learning rate for stage 2')
+    parser.add_argument('--finetune_lr', default=0.00001, type=float, help='Learning rate for stage 2')
     parser.add_argument('--finetune_wd', default=1e-4, type=float, help='Weight decay for stage 2 optimizer')
 
     # --- LOS 参数 ---
-    parser.add_argument('--label_smooth', default=0.98, type=float, help='Label over-smoothing value for LOS')
+    parser.add_argument('--label_smooth', default=0.02, type=float, help='Label smoothing epsilon value. Recommended: 0.0 ~ 0.1')
 
     # --- dynamic-cdfsl 参数 ---
     parser.add_argument('--distill_weight', default=1.0, type=float, help='Weight for the distillation loss')
