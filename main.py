@@ -57,8 +57,14 @@ def parse_args():
                         help='Apply center vector to teacher logits')
     parser.add_argument('--stage2_ce_conf_thresh', type=float, default=0.6,
                         help='Min confidence to use hard pseudo labels for CE in Stage2')
-    parser.add_argument('--distill_temperature', type=float, default=2.0,
-                        help='Temperature for KL distillation in Stage2')
+    parser.add_argument('--stage2_ce_conf_thresh_pos', type=float, default=0.3,
+                        help='Confidence threshold for POSITIVE (cough) pseudo labels in Stage2')
+    parser.add_argument('--stage2_ce_conf_thresh_neg', type=float, default=0.85,
+                        help='Confidence threshold for NEGATIVE (non-cough) pseudo labels in Stage2 (师兄建议: 0.85)')
+    parser.add_argument('--distill_temperature', type=float, default=4.0,
+                        help='Temperature for KL distillation in Stage2 (师兄建议: 4.0)')
+    parser.add_argument('--kd_neg_margin', type=float, default=0.20,
+                        help='Margin threshold for KD on negative samples: only apply KD when P(neg)-P(pos) >= margin (师兄建议: 0.20)')
     
     # --- Teacher EMA Warm-up 参数 ---
     parser.add_argument('--teacher_ema_warmup', type=int, default=5,
@@ -67,6 +73,26 @@ def parse_args():
                         help='High distillation weight during warm-up period (default: 1.0)')
     parser.add_argument('--distill_weight_low', type=float, default=0.3,
                         help='Low distillation weight after warm-up period (default: 0.3)')
+    
+    # --- KD权重余弦衰减参数 ---
+    parser.add_argument('--use_kd_cosine_decay', action='store_true', default=False,
+                        help='Enable cosine decay for KD weight from distill_weight_high to 0')
+    
+    # --- Stage 2 Label Smoothing 控制 ---
+    parser.add_argument('--disable_label_smoothing_stage2', action='store_true', default=True,
+                        help='Disable label smoothing in Stage 2 to improve recall (default: True)')
+    parser.add_argument('--enable_label_smoothing_stage2', dest='disable_label_smoothing_stage2', 
+                        action='store_false',
+                        help='Keep label smoothing enabled in Stage 2')
+    
+    # --- 阈值扫描参数（师兄建议） ---
+    parser.add_argument('--scan_threshold_after_stage2', action='store_true', default=True,
+                        help='Scan optimal threshold after Stage 2 training (default: True)')
+    parser.add_argument('--no_scan_threshold', dest='scan_threshold_after_stage2', 
+                        action='store_false',
+                        help='Disable threshold scanning after Stage 2')
+    parser.add_argument('--target_recall_threshold', type=float, default=0.85,
+                        help='Target recall threshold for threshold scanning (default: 0.85)')
 
     # --- 滑动窗口测试参数 ---
     parser.add_argument('--window_size', type=float, default=0.64, help='Sliding window size in seconds for testing')
@@ -217,10 +243,19 @@ def parse_args():
 def set_reproducibility(seed):
     if seed != 'None':
         seed = int(seed)
-        torch.manual_seed(seed)
-        torch.backends.cudnn.deterministic = True
-        np.random.seed(seed)
+        # 设置Python、NumPy、PyTorch的随机种子
         random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # 多GPU情况
+        
+        # 设置cuDNN为确定性模式
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False  # 关闭自动优化，保证可复现性
+        
+        # 设置Python哈希种子（可选，但更彻底）
+        os.environ['PYTHONHASHSEED'] = str(seed)
 
 
 def main():
@@ -248,6 +283,19 @@ def main():
     print(f"Stage 2 Sliding Window Filter: {'ENABLED' if args.use_sliding_window_filter else 'DISABLED'}")
     if args.use_sliding_window_filter:
         print(f"  - Confidence Threshold: {args.filter_confidence_threshold}")
+    print(f"Stage 2 Label Smoothing: {'DISABLED (师兄建议)' if args.disable_label_smoothing_stage2 else 'ENABLED'}")
+    print(f"Stage 2 CE Pseudo Label Threshold (Original): {args.stage2_ce_conf_thresh}")
+    print(f"Stage 2 CE Pseudo Label Threshold POS (Cough): {args.stage2_ce_conf_thresh_pos} (师兄建议)")
+    print(f"Stage 2 CE Pseudo Label Threshold NEG (Non-Cough): {args.stage2_ce_conf_thresh_neg} (师兄建议)")
+    print(f"KD Temperature: {args.distill_temperature} (师兄建议)")
+    print(f"KD Negative Margin: {args.kd_neg_margin} (师兄建议)")
+    print(f"KD Weight Cosine Decay: {'ENABLED (师兄建议)' if args.use_kd_cosine_decay else 'DISABLED'}")
+    if args.use_kd_cosine_decay:
+        print(f"  - Initial KD Weight: {args.distill_weight_high}")
+        print(f"  - Final KD Weight: 0.0 (余弦衰减)")
+    print(f"Threshold Scanning After Stage 2: {'ENABLED' if args.scan_threshold_after_stage2 else 'DISABLED'}")
+    if args.scan_threshold_after_stage2:
+        print(f"  - Target Recall: {args.target_recall_threshold}")
     print("="*60 + "\n")
 
     # 实例化训练器

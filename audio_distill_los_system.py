@@ -124,62 +124,122 @@ class AudioDistillLOSSystem(nn.Module):
             'stage': 'stage1'
         }
     
-    def compute_stage2_loss(self, batch_unlabeled):
+    def get_stage2_optimizer(self, lr=1e-4, weight_decay=1e-4):
         """
-        Stage 2: 仅使用目标域数据进行自我蒸馏和伪标签学习
-        改进：
-        1. 仅对高置信伪标签计算CE（避免低置信伪标签污染）
-        2. 使用构建的长尾损失（self.loss_function）而非原始CE
-        3. 蒸馏使用温度T，并乘以T^2进行缩放
+        Stage 2: AdamW optimizer with parameter groups for fine-tuning.
+        - Classifier (head) gets the full learning rate.
+        - Feature extractor's embeddings get a smaller learning rate.
+        - Feature extractor's feature layers remain frozen.
         """
-        (x_u_weak, x_u_strong), *_ = batch_unlabeled
+        groups = []
+        # Embeddings with a lower learning rate
+        if hasattr(self.feature_extractor, 'embeddings') and self.feature_extractor.embeddings is not None:
+            groups.append({'params': self.feature_extractor.embeddings.parameters(), 'lr': lr * 0.33})
         
-        # 教师模型处理弱增强数据，生成"真理"
-        with torch.no_grad():
-            teacher_scores = self.teacher(x_u_weak)
-            teacher_probs = F.softmax(teacher_scores, dim=-1)
-            # 创建硬伪标签用于额外的监督损失
-            pseudo_labels = teacher_probs.argmax(dim=1)
-            max_conf = teacher_probs.max(dim=1).values
+        # Classifier (head) with the main learning rate
+        groups.append({'params': self.classifier.parameters(), 'lr': lr})
+        
+        return torch.optim.AdamW(groups, lr=lr, weight_decay=weight_decay)
 
-        # 学生模型处理强增强数据
-        student_scores = self.student(x_u_strong)
+    def get_stage1_optimizer(self, lr=0.1, weight_decay=5e-4):
+        return torch.optim.AdamW(
+            self.parameters(),
+            lr=lr,
+            weight_decay=weight_decay
+        )
+    
+    def switch_to_stage2(self):
+        """切换到Stage 2模式"""
+        self.current_stage = 2
+        self.freeze_backbone_for_stage2()
+        if self.teacher is None:
+            self.create_teacher()
         
-        # 1. 监督损失：只对高置信度样本计算"监督式"CE（阈值可配置）
-        tau = getattr(self.hparams, 'stage2_ce_conf_thresh', 0.6)
-        mask = max_conf >= tau
-        if mask.any():
-            # 用构造的长尾损失，自动支持 Focal / LogitAdj / class weights
-            loss_ce = self.loss_function(student_scores[mask], pseudo_labels[mask])
+        # Stage 2：关闭Label Smoothing以提高召回率
+        disable_label_smoothing_stage2 = getattr(self.hparams, 'disable_label_smoothing_stage2', True)
+        if disable_label_smoothing_stage2:
+            original_smooth = self.label_smooth
+            self.label_smooth = 0.0
+            
+            # 重新创建损失函数（不使用label smoothing）
+            temp_smooth = self.hparams.label_smooth
+            self.hparams.label_smooth = 0.0
+            self.loss_function = create_loss_function(self.hparams, self.class_counts)
+            self.hparams.label_smooth = temp_smooth  # 恢复原始值，仅供记录
+            
+            print(f"Stage 2: Label Smoothing 已关闭 (从 {original_smooth} 改为 0.0)")
+        
+        print("Switched to Stage 2: classifier retraining with distillation.")
+        print(f"Loss function configuration: {type(self.loss_function.loss_fn).__name__}")
+    
+    def get_feature_extractor(self):
+        """获取特征提取器"""
+        if hasattr(self, 'teacher') and self.teacher is not None:
+            return self.teacher  # 返回教师模型作为特征提取器
+        else:
+            return self.feature_extractor  # 返回学生模型的特征提取器
+
+    def compute_stage2_loss(self, student_scores, teacher_scores, pseudo_labels, max_conf, is_weak):
+        """
+        Computes the loss for Stage 2 using category-aware thresholds for pseudo-labels
+        and distillation on high-confidence negative samples with margin constraint.
+        
+        师兄建议的改进：
+        1. 负类阈值提高到0.85（从0.7）
+        2. KD仅在"高置信度+高margin"的负类上计算
+        """
+        # --- 1. Category-Aware Pseudo-Label Masking ---
+        tau_pos = getattr(self.hparams, 'stage2_ce_conf_thresh_pos', 0.3)
+        tau_neg = getattr(self.hparams, 'stage2_ce_conf_thresh_neg', 0.85)  # 从0.7提高到0.85 (师兄建议)
+
+        # Assuming 0 is the positive class (cough), 1 is negative class (non-cough)
+        pos_class_mask = (pseudo_labels == 0)
+        neg_class_mask = ~pos_class_mask
+
+        mask_pos = pos_class_mask & (max_conf >= tau_pos)
+        mask_neg = neg_class_mask & (max_conf >= tau_neg)
+        
+        # Combined mask for Cross-Entropy loss
+        ce_mask = mask_pos | mask_neg
+
+        # --- 2. Supervised Cross-Entropy on Masked Pseudo-Labels ---
+        if ce_mask.any():
+            loss_ce = self.loss_function(student_scores[ce_mask], pseudo_labels[ce_mask])
         else:
             loss_ce = torch.zeros((), device=student_scores.device)
 
-        # 2. 蒸馏损失：使用温度T，并乘以T^2
-        T = getattr(self.hparams, 'distill_temperature', 2.0)
-        student_log_probs = F.log_softmax(student_scores / T, dim=-1)
-        teacher_soft = F.softmax(teacher_scores / T, dim=-1)
-        distill_loss = F.kl_div(student_log_probs, teacher_soft.detach(), reduction='batchmean') * (T * T)
+        # --- 3. Distillation Loss on High-Confidence + High-Margin NEGATIVE Samples ---
+        distill_loss = torch.zeros((), device=student_scores.device)
+        dw = getattr(self.hparams, 'distill_weight', 0.0)
+
+        # Only compute distillation if weight is positive and there are high-confidence negative samples
+        if dw > 0 and mask_neg.any():
+            T = getattr(self.hparams, 'distill_temperature', 4.0)
+            kd_neg_margin = getattr(self.hparams, 'kd_neg_margin', 0.20)  # 新增：KD负类margin约束 (师兄建议)
+            
+            with torch.no_grad():
+                # 计算teacher在负类样本上的概率分布
+                t_probs = F.softmax(teacher_scores[mask_neg] / T, dim=-1)
+                # 计算margin: P(non-cough) - P(cough)
+                # 假设类别1是non-cough, 类别0是cough
+                margin = t_probs[:, 1] - t_probs[:, 0]
+                # 只保留margin >= kd_neg_margin的样本
+                kd_mask = margin >= kd_neg_margin
+            
+            # 如果有满足margin条件的样本，才计算KD loss
+            if kd_mask.any():
+                student_log_probs = F.log_softmax(student_scores[mask_neg][kd_mask] / T, dim=-1)
+                
+                with torch.no_grad():
+                    teacher_soft = F.softmax(teacher_scores[mask_neg][kd_mask] / T, dim=-1)
+                
+                distill_loss = F.kl_div(student_log_probs, teacher_soft.detach(), reduction='batchmean') * (T * T)
+
+        # --- 4. Total Loss ---
+        total_loss = loss_ce + dw * distill_loss
         
-        # 总损失：结合两种损失
-        distill_weight = getattr(self.hparams, 'distill_weight', 1.0)
-        total_loss = loss_ce + distill_weight * distill_loss
-        
-        # 计算伪标签的准确率（用于监控）
-        train_acc = accuracy(student_scores.argmax(dim=-1), pseudo_labels, 
-                           task='multiclass', num_classes=self.num_classes)
-        
-        # 额外监控信息
-        high_conf_ratio = mask.float().mean().item()
-        
-        return {
-            'loss': total_loss,
-            'loss_ce': loss_ce,
-            'loss_distill': distill_loss,
-            'train_acc': train_acc,
-            'high_conf_ratio': high_conf_ratio,
-            'stage': 'stage2'
-        }
-    
+        return total_loss, loss_ce, distill_loss
+
     def _compute_distillation_loss(self, x_u_weak, scores_u_strong):
         """
         dynamic-cdfsl动态蒸馏损失计算
@@ -255,40 +315,3 @@ class AudioDistillLOSSystem(nn.Module):
         for param in self.parameters():
             param.requires_grad = True
         print("All parameters unfrozen.")
-    
-    def get_stage2_optimizer(self, lr=0.01, weight_decay=1e-4):
-        params = [p for p in self.parameters() if p.requires_grad]
-
-        return torch.optim.SGD(
-            params,
-            lr=lr,
-            momentum=0.9,
-            weight_decay=weight_decay
-        )
-    
-    def get_stage1_optimizer(self, lr=0.1, weight_decay=5e-4):
-        return torch.optim.AdamW(
-            self.parameters(),
-            lr=lr,
-            weight_decay=weight_decay
-        )
-    
-    def switch_to_stage2(self):
-        """切换到Stage 2模式"""
-        self.current_stage = 2
-        self.freeze_backbone_for_stage2()
-        if self.teacher is None:
-            self.create_teacher()
-        
-        # Stage 2可能需要重新初始化损失函数（如果需要不同的配置）
-        # 但通常我们保持相同的损失函数配置
-        
-        print("Switched to Stage 2: classifier retraining with distillation.")
-        print(f"Loss function configuration remains: {type(self.loss_function.loss_fn).__name__}")
-    
-    def get_feature_extractor(self):
-        """获取特征提取器"""
-        if hasattr(self, 'teacher') and self.teacher is not None:
-            return self.teacher  # 返回教师模型作为特征提取器
-        else:
-            return self.feature_extractor  # 返回学生模型的特征提取器
