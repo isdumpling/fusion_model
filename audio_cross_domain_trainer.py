@@ -297,6 +297,10 @@ class CrossDomainAudioTrainer:
         """
         Stage 2: 分类器重训练 + 动态蒸馏
         支持基于置信度的课程学习策略
+        
+        师兄建议：
+        - 目标域数据接近均衡(399 cough / 412 non-cough)，关闭WeightedRandomSampler
+        - 在均衡数据上使用加权采样会破坏概率校准
         """
         print("=" * 50)
         print("Starting Stage 2: Classifier Retraining with Cross-Domain Distillation")
@@ -305,6 +309,23 @@ class CrossDomainAudioTrainer:
             print(f"[INFO] 源域/目标域批次比率: {self.args.source_target_ratio}")
         else:
             print(f"[INFO] Stage 2 仅使用目标域数据（纯自我学习）")
+        
+        # 师兄建议：Stage 2 关闭加权采样（目标域接近均衡）
+        use_weighted_sampler_stage2 = getattr(self.args, 'use_weighted_sampler_stage2', False)
+        if use_weighted_sampler_stage2:
+            print(f"[INFO] Stage 2 使用WeightedRandomSampler")
+        else:
+            print(f"[INFO] Stage 2 关闭WeightedRandomSampler（师兄建议：目标域接近均衡，无需加权）")
+            # 重新创建目标域数据加载器（不使用加权采样）
+            self.target_unlabeled_loader = data.DataLoader(
+                self.target_trainset,
+                batch_size=self.args.batch_size,
+                shuffle=True,
+                num_workers=self.args.workers,
+                pin_memory=True,
+                drop_last=True,
+                worker_init_fn=worker_init_fn
+            )
         print("=" * 50)
         
         if self.best_model is not None:
@@ -854,10 +875,160 @@ class CrossDomainAudioTrainer:
         finally:
             plt.close()
     
+    def apply_temperature_scaling(self, logits, labels):
+        """
+        温度缩放（Temperature Scaling）用于概率校准
+        使用验证集优化温度参数T，使预测概率更准确
+        
+        师兄建议：优先级A-1，立竿见影的校准方法
+        
+        Args:
+            logits: 模型原始logits (N, num_classes)
+            labels: 真实标签 (N,)
+        
+        Returns:
+            optimal_temperature: 最优温度参数
+        """
+        from torch.optim import LBFGS
+        
+        print("\n" + "=" * 60)
+        print("Temperature Scaling - 概率校准 (师兄建议: 优先级A-1)")
+        print("=" * 60)
+        
+        # 创建温度参数
+        temperature = nn.Parameter(torch.ones(1).cuda() * 1.5)
+        
+        # NLL损失
+        criterion = nn.CrossEntropyLoss()
+        
+        # 优化温度
+        optimizer = LBFGS([temperature], lr=0.01, max_iter=50)
+        
+        def eval():
+            optimizer.zero_grad()
+            loss = criterion(logits / temperature, labels.long())
+            loss.backward()
+            return loss
+        
+        optimizer.step(eval)
+        
+        optimal_temp = temperature.item()
+        print(f"最优温度 T = {optimal_temp:.4f}")
+        print(f"校准前后对比：温度缩放可以将过度自信的概率拉回合理区间")
+        print("=" * 60 + "\n")
+        
+        self.logger(f"Temperature Scaling: 最优温度 T = {optimal_temp:.4f}", level=1)
+        
+        return optimal_temp
+    
+    def apply_prior_shift(self, logits, source_prior=0.07, target_prior=0.49):
+        """
+        先验logit平移：补偿源域和目标域的类别先验不匹配
+        
+        师兄建议：优先级A-2
+        源域先验 7% → 目标域 ~49%
+        在推理时给 cough logit 加上 Δ = logit(π_target) - logit(π_source)
+        
+        Args:
+            logits: 模型原始logits (N, 2)，[:, 0]是cough, [:, 1]是non-cough
+            source_prior: 源域正类先验
+            target_prior: 目标域正类先验
+        
+        Returns:
+            adjusted_logits: 调整后的logits
+        """
+        import math
+        
+        # 计算logit偏移量
+        delta = math.log(target_prior / (1 - target_prior)) - math.log(source_prior / (1 - source_prior))
+        
+        print(f"\n应用先验logit平移（师兄建议: 优先级A-2）")
+        print(f"  源域先验: {source_prior:.4f}")
+        print(f"  目标域先验: {target_prior:.4f}")
+        print(f"  Logit偏移量 Δ: {delta:.4f}")
+        print(f"  效果：系统性降低cough的判决阈值\n")
+        
+        # 对cough类的logit加上偏移量
+        adjusted_logits = logits.clone()
+        adjusted_logits[:, 0] += delta
+        
+        return adjusted_logits
+    
+    def plot_pr_curve(self, y_true, y_scores, save_path):
+        """
+        绘制PR曲线（Precision-Recall Curve）
+        
+        师兄建议：诊断工具，查看模型在不同阈值下的性能
+        """
+        from sklearn.metrics import precision_recall_curve, average_precision_score
+        
+        precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
+        ap = average_precision_score(y_true, y_scores)
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(recall, precision, marker='.', label=f'PR Curve (AP={ap:.4f})')
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title('Precision-Recall Curve (师兄建议: 诊断工具)')
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+        
+        print(f"PR曲线已保存到: {save_path}")
+        self.logger(f"PR曲线已保存到: {save_path}", level=1)
+        self.logger(f"Average Precision: {ap:.4f}", level=1)
+    
+    def plot_score_histogram(self, y_true, y_scores, save_path):
+        """
+        绘制分数直方图（正负样本分开）
+        
+        师兄建议：诊断工具
+        如果两条直方图几乎完全重叠在低分区，就是"整体打分偏低"的铁证
+        """
+        pos_scores = y_scores[y_true == 1]
+        neg_scores = y_scores[y_true == 0]
+        
+        plt.figure(figsize=(12, 6))
+        plt.hist(neg_scores, bins=50, alpha=0.5, label=f'Non-Cough (n={len(neg_scores)})', color='blue')
+        plt.hist(pos_scores, bins=50, alpha=0.5, label=f'Cough (n={len(pos_scores)})', color='red')
+        plt.xlabel('Prediction Score (Probability)')
+        plt.ylabel('Frequency')
+        plt.title('Score Histogram: Pos vs Neg (师兄建议: 校准诊断)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 添加统计信息
+        info_text = f"Cough: mean={pos_scores.mean():.4f}, std={pos_scores.std():.4f}\n"
+        info_text += f"Non-Cough: mean={neg_scores.mean():.4f}, std={neg_scores.std():.4f}"
+        plt.text(0.02, 0.98, info_text, transform=plt.gca().transAxes,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
+        
+        print(f"分数直方图已保存到: {save_path}")
+        self.logger(f"分数直方图已保存到: {save_path}", level=1)
+        self.logger(f"Cough scores - mean: {pos_scores.mean():.4f}, std: {pos_scores.std():.4f}", level=1)
+        self.logger(f"Non-Cough scores - mean: {neg_scores.mean():.4f}, std: {neg_scores.std():.4f}", level=1)
+        
+        # 检查是否严重重叠
+        if abs(pos_scores.mean() - neg_scores.mean()) < 0.2:
+            print("⚠️  警告：正负样本分数严重重叠！这是'整体打分偏低/欠校准'的证据")
+            self.logger("⚠️  警告：正负样本分数严重重叠，需要校准", level=1)
+
     def scan_optimal_threshold(self, testloader, target_recall=0.85):
         """
-        在验证集上扫描最优决策阈值
-        目标：找到Recall≥target_recall的最小阈值τ，在该约束下选择F2最优的点
+        在验证集上扫描最优决策阈值（整合师兄建议的所有校准技术）
+        
+        改进：
+        1. 温度缩放（Temperature Scaling）- 优先级A-1
+        2. 先验logit平移 - 优先级A-2
+        3. PR曲线可视化
+        4. 分数直方图诊断
+        5. 阈值选择（目标Recall约束下的F2最优）
         
         Args:
             testloader: 验证集数据加载器
@@ -872,7 +1043,7 @@ class CrossDomainAudioTrainer:
         y_true_list = []
         
         print("\n" + "=" * 60)
-        print(f"扫描最优阈值（目标Recall≥{target_recall}）...")
+        print(f"扫描最优阈值（目标Recall≥{target_recall}）- 师兄建议的完整流程")
         print("=" * 60)
         
         # 收集所有验证集的logits和真实标签
@@ -882,17 +1053,48 @@ class CrossDomainAudioTrainer:
                 target = batch[1].cuda()
                 
                 outputs = self.model(spectrogram)
-                logits_list.append(outputs[:, 0])  # 咳嗽类的logit（假设类别0是咳嗽）
+                logits_list.append(outputs)
                 y_true_list.append(target)
         
         # 合并所有batch的结果
-        logits = torch.cat(logits_list)
+        logits = torch.cat(logits_list)  # (N, 2)
         y_true = torch.cat(y_true_list).float()
         
-        # 计算sigmoid概率
-        probs = torch.sigmoid(logits)
+        # ===== 步骤1: 温度缩放（师兄建议: 优先级A-1）=====
+        temperature = 1.0
+        if getattr(self.args, 'apply_temperature_scaling', True):
+            temperature = self.apply_temperature_scaling(logits, y_true)
+            logits_calibrated = logits / temperature
+        else:
+            logits_calibrated = logits
+            print("跳过温度缩放")
         
-        # 扫描阈值
+        # ===== 步骤2: 先验logit平移（师兄建议: 优先级A-2）=====
+        if getattr(self.args, 'apply_prior_shift', True):
+            source_prior = getattr(self.args, 'source_prior', 0.07)
+            target_prior = getattr(self.args, 'target_prior', 0.49)
+            logits_final = self.apply_prior_shift(logits_calibrated, source_prior, target_prior)
+        else:
+            logits_final = logits_calibrated
+            print("跳过先验logit平移")
+        
+        # 计算最终的概率（使用softmax）
+        probs = F.softmax(logits_final, dim=1)[:, 0]  # cough类的概率
+        
+        # ===== 步骤3: 可视化诊断（师兄建议: 排查清单）=====
+        # 转换为numpy用于绘图
+        y_true_np = y_true.cpu().numpy()
+        probs_np = probs.cpu().numpy()
+        
+        if getattr(self.args, 'plot_pr_curve', True):
+            pr_curve_path = os.path.join(self.args.out, 'pr_curve_stage2.png')
+            self.plot_pr_curve(y_true_np, probs_np, pr_curve_path)
+        
+        if getattr(self.args, 'plot_score_histogram', True):
+            histogram_path = os.path.join(self.args.out, 'score_histogram_stage2.png')
+            self.plot_score_histogram(y_true_np, probs_np, histogram_path)
+        
+        # ===== 步骤4: 扫描最优阈值（目标Recall约束下的F2最优）=====
         taus = torch.linspace(0, 1, 1001)
         best = None
         
@@ -923,12 +1125,14 @@ class CrossDomainAudioTrainer:
                         'tp': tp,
                         'fp': fp,
                         'fn': fn,
-                        'tn': tn
+                        'tn': tn,
+                        'temperature': temperature
                     }
         
         if best is None:
             # 如果没有找到满足条件的阈值，返回召回率最高的阈值
-            print(f"警告：未找到满足Recall≥{target_recall}的阈值，返回最高召回率的阈值")
+            print(f"⚠️  警告：未找到满足Recall≥{target_recall}的阈值，返回最高召回率的阈值")
+            print(f"   这说明模型对cough的打分整体偏低，严重欠校准！")
             max_recall = 0
             for t in taus:
                 y_pred = (probs >= t).float()
@@ -951,13 +1155,15 @@ class CrossDomainAudioTrainer:
                         'tp': tp,
                         'fp': fp,
                         'fn': fn,
-                        'tn': tn
+                        'tn': tn,
+                        'temperature': temperature
                     }
         
         # 打印结果
         print("\n" + "=" * 60)
-        print("最优阈值扫描结果:")
+        print("最优阈值扫描结果（已应用师兄建议的校准）:")
         print("=" * 60)
+        print(f"温度参数 T: {temperature:.4f}")
         print(f"最优阈值 τ: {best['tau']:.4f}")
         print(f"召回率 (Recall): {best['recall']:.4f}")
         print(f"精确率 (Precision): {best['precision']:.4f}")
@@ -968,9 +1174,10 @@ class CrossDomainAudioTrainer:
         
         # 记录到日志
         self.logger("=" * 60, level=1)
-        self.logger("最优阈值扫描结果", level=1)
+        self.logger("最优阈值扫描结果（已应用校准）", level=1)
         self.logger("=" * 60, level=1)
         self.logger(f"目标召回率: {target_recall}", level=1)
+        self.logger(f"温度参数 T: {temperature:.4f}", level=1)
         self.logger(f"最优阈值 τ: {best['tau']:.4f}", level=1)
         self.logger(f"召回率 (Recall): {best['recall']:.4f}", level=1)
         self.logger(f"精确率 (Precision): {best['precision']:.4f}", level=1)

@@ -43,7 +43,8 @@ def parse_args():
 
     # --- Stage 2: 分类器微调和蒸馏参数 (源域+目标域) ---
     parser.add_argument('--finetune_epoch', default=30, type=int, help='Number of total epochs for stage 2')
-    parser.add_argument('--finetune_lr', default=0.00001, type=float, help='Learning rate for stage 2')
+    parser.add_argument('--finetune_lr', default=3e-5, type=float, 
+                        help='Learning rate for stage 2 (师兄建议: 3e-5, 原1e-5太小导致无法充分自适应)')
     parser.add_argument('--finetune_wd', default=1e-4, type=float, help='Weight decay for stage 2 optimizer')
 
     # --- LOS 参数 ---
@@ -69,10 +70,10 @@ def parse_args():
     # --- Teacher EMA Warm-up 参数 ---
     parser.add_argument('--teacher_ema_warmup', type=int, default=5,
                         help='Number of epochs to wait before starting teacher EMA updates (default: 5)')
-    parser.add_argument('--distill_weight_high', type=float, default=1.0,
-                        help='High distillation weight during warm-up period (default: 1.0)')
-    parser.add_argument('--distill_weight_low', type=float, default=0.3,
-                        help='Low distillation weight after warm-up period (default: 0.3)')
+    parser.add_argument('--distill_weight_high', type=float, default=0.5,
+                        help='High distillation weight during warm-up period (师兄建议: 0.5, 原1.0会固化Stage1的负向偏置)')
+    parser.add_argument('--distill_weight_low', type=float, default=0.1,
+                        help='Low distillation weight after warm-up period (师兄建议: 0.1, 原0.3仍过高)')
     
     # --- KD权重余弦衰减参数 ---
     parser.add_argument('--use_kd_cosine_decay', action='store_true', default=False,
@@ -93,6 +94,22 @@ def parse_args():
                         help='Disable threshold scanning after Stage 2')
     parser.add_argument('--target_recall_threshold', type=float, default=0.85,
                         help='Target recall threshold for threshold scanning (default: 0.85)')
+    
+    # --- 温度缩放和先验logit平移参数（师兄建议优先级A-1, A-2）---
+    parser.add_argument('--apply_temperature_scaling', action='store_true', default=True,
+                        help='Apply temperature scaling for probability calibration (师兄建议: 优先级A-1)')
+    parser.add_argument('--apply_prior_shift', action='store_true', default=True,
+                        help='Apply prior logit shift to compensate for source-target domain prior mismatch (师兄建议: 优先级A-2)')
+    parser.add_argument('--source_prior', type=float, default=0.07,
+                        help='Source domain prior for positive class (cough), default=0.07 (96/1369)')
+    parser.add_argument('--target_prior', type=float, default=0.49,
+                        help='Target domain prior for positive class (cough), default=0.49 (399/811)')
+    
+    # --- 可视化和诊断参数（师兄建议优先级A-排查清单）---
+    parser.add_argument('--plot_pr_curve', action='store_true', default=True,
+                        help='Plot Precision-Recall curve after Stage 2 (default: True)')
+    parser.add_argument('--plot_score_histogram', action='store_true', default=True,
+                        help='Plot score histogram (pos/neg separately) for calibration diagnosis (default: True)')
 
     # --- 滑动窗口测试参数 ---
     parser.add_argument('--window_size', type=float, default=0.64, help='Sliding window size in seconds for testing')
@@ -109,9 +126,11 @@ def parse_args():
     
     # --- WeightedRandomSampler 控制 ---
     parser.add_argument('--use_weighted_sampler', action='store_true', default=True,
-                        help='Use weighted random sampler to handle class imbalance')
+                        help='Use weighted random sampler to handle class imbalance (Stage 1)')
     parser.add_argument('--no_weighted_sampler', dest='use_weighted_sampler', action='store_false',
                         help='Disable weighted random sampler')
+    parser.add_argument('--use_weighted_sampler_stage2', action='store_true', default=False,
+                        help='Use weighted sampler in Stage 2 (师兄建议: False, 目标域接近均衡无需加权)')
     
     # --- Focal Loss 参数 ---
     parser.add_argument('--use_focal_loss', action='store_true', default=False,
@@ -120,6 +139,12 @@ def parse_args():
                         help='Focal loss gamma parameter. Set to 0 to disable focal loss effect')
     parser.add_argument('--focal_alpha', type=float, default=None,
                         help='Focal loss alpha parameter for class weighting. None for no weighting')
+    
+    # --- BCEWithLogits pos_weight 参数（师兄建议优先级B-5）---
+    parser.add_argument('--use_bce_pos_weight', action='store_true', default=False,
+                        help='Use BCEWithLogitsLoss with pos_weight to boost recall')
+    parser.add_argument('--bce_pos_weight', type=float, default=2.0,
+                        help='pos_weight for positive class (cough) in BCEWithLogits. Higher = more recall. 建议: 1.5-3.0')
     
     # --- Logit Adjustment 参数 ---
     parser.add_argument('--use_logit_adjustment', action='store_true', default=False,
@@ -264,12 +289,13 @@ def main():
     
     # 打印消融实验配置
     print("\n" + "="*60)
-    print("ABLATION EXPERIMENT CONFIGURATION")
+    print("EXPERIMENT CONFIGURATION (师兄建议的改进)")
     print("="*60)
     print(f"Skip Stage 1: {'YES' if args.skip_stage1 else 'NO'}")
     if args.skip_stage1:
         print(f"  - Stage 1 Model Path: {args.stage1_model_path if args.stage1_model_path else 'Auto (latest from output/)'}")
-    print(f"WeightedRandomSampler: {'ENABLED' if args.use_weighted_sampler else 'DISABLED'}")
+    print(f"\n[Stage 1 配置]")
+    print(f"WeightedRandomSampler (Stage 1): {'ENABLED' if args.use_weighted_sampler else 'DISABLED'}")
     print(f"Focal Loss: {'ENABLED' if args.use_focal_loss else 'DISABLED'}")
     if args.use_focal_loss:
         print(f"  - Gamma: {args.focal_gamma}")
@@ -277,25 +303,33 @@ def main():
     print(f"Logit Adjustment: {'ENABLED' if args.use_logit_adjustment else 'DISABLED'}")
     if args.use_logit_adjustment:
         print(f"  - Tau: {args.logit_adj_tau}")
-    print(f"Stage 2 Use Source Data: {'ENABLED' if args.use_source_in_stage2 else 'DISABLED'}")
-    if args.use_source_in_stage2:
-        print(f"  - Source/Target Ratio: {args.source_target_ratio}")
-    print(f"Stage 2 Sliding Window Filter: {'ENABLED' if args.use_sliding_window_filter else 'DISABLED'}")
-    if args.use_sliding_window_filter:
-        print(f"  - Confidence Threshold: {args.filter_confidence_threshold}")
-    print(f"Stage 2 Label Smoothing: {'DISABLED (师兄建议)' if args.disable_label_smoothing_stage2 else 'ENABLED'}")
-    print(f"Stage 2 CE Pseudo Label Threshold (Original): {args.stage2_ce_conf_thresh}")
-    print(f"Stage 2 CE Pseudo Label Threshold POS (Cough): {args.stage2_ce_conf_thresh_pos} (师兄建议)")
-    print(f"Stage 2 CE Pseudo Label Threshold NEG (Non-Cough): {args.stage2_ce_conf_thresh_neg} (师兄建议)")
-    print(f"KD Temperature: {args.distill_temperature} (师兄建议)")
-    print(f"KD Negative Margin: {args.kd_neg_margin} (师兄建议)")
-    print(f"KD Weight Cosine Decay: {'ENABLED (师兄建议)' if args.use_kd_cosine_decay else 'DISABLED'}")
-    if args.use_kd_cosine_decay:
-        print(f"  - Initial KD Weight: {args.distill_weight_high}")
-        print(f"  - Final KD Weight: 0.0 (余弦衰减)")
-    print(f"Threshold Scanning After Stage 2: {'ENABLED' if args.scan_threshold_after_stage2 else 'DISABLED'}")
+    
+    print(f"\n[Stage 2 配置 - 师兄建议的关键改进]")
+    print(f"Learning Rate: {args.finetune_lr:.2e} (师兄建议: 提升到3e-5)")
+    print(f"WeightedRandomSampler (Stage 2): {'ENABLED' if args.use_weighted_sampler_stage2 else 'DISABLED (师兄建议: 目标域均衡无需加权)'}")
+    print(f"Distillation Weight (High→Low): {args.distill_weight_high} → {args.distill_weight_low} (师兄建议: 降低以减少负向偏置固化)")
+    print(f"KD Weight Cosine Decay: {'ENABLED' if args.use_kd_cosine_decay else 'DISABLED'}")
+    print(f"KD Temperature: {args.distill_temperature} (师兄建议: 提高温度)")
+    print(f"KD Negative Margin: {args.kd_neg_margin} (师兄建议: margin约束)")
+    print(f"Label Smoothing (Stage 2): {'DISABLED (师兄建议)' if args.disable_label_smoothing_stage2 else 'ENABLED'}")
+    print(f"BCE pos_weight: {'ENABLED (weight=' + str(args.bce_pos_weight) + ')' if args.use_bce_pos_weight else 'DISABLED'}")
+    
+    print(f"\n[概率校准和阈值 - 师兄建议优先级A]")
+    print(f"Temperature Scaling: {'ENABLED (师兄建议: 优先级A-1)' if args.apply_temperature_scaling else 'DISABLED'}")
+    print(f"Prior Logit Shift: {'ENABLED (师兄建议: 优先级A-2)' if args.apply_prior_shift else 'DISABLED'}")
+    if args.apply_prior_shift:
+        print(f"  - Source Prior: {args.source_prior:.4f}")
+        print(f"  - Target Prior: {args.target_prior:.4f}")
+        import numpy as np
+        delta = np.log(args.target_prior / (1 - args.target_prior)) - np.log(args.source_prior / (1 - args.source_prior))
+        print(f"  - Logit Shift (Δ): {delta:.4f} (系统性降低cough阈值)")
+    print(f"Threshold Scanning: {'ENABLED' if args.scan_threshold_after_stage2 else 'DISABLED'}")
     if args.scan_threshold_after_stage2:
         print(f"  - Target Recall: {args.target_recall_threshold}")
+    
+    print(f"\n[可视化和诊断]")
+    print(f"Plot PR Curve: {'ENABLED' if args.plot_pr_curve else 'DISABLED'}")
+    print(f"Plot Score Histogram: {'ENABLED' if args.plot_score_histogram else 'DISABLED'}")
     print("="*60 + "\n")
 
     # 实例化训练器

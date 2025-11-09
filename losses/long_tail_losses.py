@@ -107,6 +107,40 @@ class LogitAdjustment(nn.Module):
         return self.base_loss(adjusted_logits, targets)
 
 
+class BCEWithLogitsLossWrapper(nn.Module):
+    """
+    BCEWithLogitsLoss with pos_weight for binary classification
+    
+    师兄建议：优先级B-5
+    pos_weight > 1 会增加正类（cough）的损失权重，从而提升recall
+    建议范围：1.5-3.0
+    """
+    def __init__(self, pos_weight=1.0):
+        super(BCEWithLogitsLossWrapper, self).__init__()
+        self.pos_weight = torch.tensor([pos_weight])
+        self.loss_fn = None  # Will be created on first forward pass
+        
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: (N, 2) for binary classification
+            targets: (N,) with values 0 or 1
+        """
+        # 对于二分类，只需要logit[:, 0] (cough类)
+        # 将目标转换为float
+        targets_float = targets.float()
+        
+        # 创建损失函数（在第一次调用时移动pos_weight到正确的设备）
+        if self.loss_fn is None or self.pos_weight.device != logits.device:
+            self.pos_weight = self.pos_weight.to(logits.device)
+            self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+        
+        # 只使用cough类的logit
+        cough_logits = logits[:, 0]
+        
+        return self.loss_fn(cough_logits, targets_float)
+
+
 class CombinedLongTailLoss(nn.Module):
     """
     Combined loss function for long-tail learning with multiple techniques
@@ -116,10 +150,17 @@ class CombinedLongTailLoss(nn.Module):
         
         self.use_focal_loss = args.use_focal_loss
         self.use_logit_adjustment = args.use_logit_adjustment
+        self.use_bce_pos_weight = getattr(args, 'use_bce_pos_weight', False)
         self.label_smooth = args.label_smooth
         
+        # 师兄建议：优先使用BCEWithLogits pos_weight来提升recall（优先级B-5）
+        if self.use_bce_pos_weight:
+            pos_weight = getattr(args, 'bce_pos_weight', 2.0)
+            print(f"[Loss] Using BCEWithLogitsLoss with pos_weight={pos_weight} (师兄建议: 提升recall)")
+            self.loss_fn = BCEWithLogitsLossWrapper(pos_weight=pos_weight)
+        
         # Build the appropriate loss function based on configuration
-        if self.use_logit_adjustment:
+        elif self.use_logit_adjustment:
             # Logit adjustment as the main framework
             base_loss_type = 'focal' if self.use_focal_loss else 'ce'
             tau = args.logit_adj_tau if hasattr(args, 'logit_adj_tau') else 1.0
@@ -144,7 +185,7 @@ class CombinedLongTailLoss(nn.Module):
         
         else:
             # Standard cross entropy with optional label smoothing
-            if self.label_smooth < 1.0:
+            if self.label_smooth > 0:
                 self.loss_fn = nn.CrossEntropyLoss(label_smoothing=self.label_smooth)
             else:
                 self.loss_fn = nn.CrossEntropyLoss()
