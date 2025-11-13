@@ -986,14 +986,17 @@ class CrossDomainAudioTrainer:
         
         师兄建议：诊断工具
         如果两条直方图几乎完全重叠在低分区，就是"整体打分偏低"的铁证
+        
+        注意：y_true中 0=cough（正类）, 1=non-cough（负类）
         """
-        pos_scores = y_scores[y_true == 1]
-        neg_scores = y_scores[y_true == 0]
+        # 修正：y_true==0 才是 cough（正类）
+        pos_scores = y_scores[y_true == 0]  # cough
+        neg_scores = y_scores[y_true == 1]  # non-cough
         
         plt.figure(figsize=(12, 6))
         plt.hist(neg_scores, bins=50, alpha=0.5, label=f'Non-Cough (n={len(neg_scores)})', color='blue')
         plt.hist(pos_scores, bins=50, alpha=0.5, label=f'Cough (n={len(pos_scores)})', color='red')
-        plt.xlabel('Prediction Score (Probability)')
+        plt.xlabel('Prediction Score (Probability of Cough)')
         plt.ylabel('Frequency')
         plt.title('Score Histogram: Pos vs Neg (师兄建议: 校准诊断)')
         plt.legend()
@@ -1021,18 +1024,19 @@ class CrossDomainAudioTrainer:
 
     def scan_optimal_threshold(self, testloader, target_recall=0.85):
         """
-        在验证集上扫描最优决策阈值（整合师兄建议的所有校准技术）
+        在验证集上扫描最优决策阈值（师兄建议的修正实现）
         
-        改进：
+        改进（师兄建议）：
         1. 温度缩放（Temperature Scaling）- 优先级A-1
         2. 先验logit平移 - 优先级A-2
         3. PR曲线可视化
         4. 分数直方图诊断
-        5. 阈值选择（目标Recall约束下的F2最优）
+        5. 阈值选择：直接最大化 Macro-F1（不再使用固定召回率约束）
+        6. 修正：以 cough (label=0) 为正类
         
         Args:
             testloader: 验证集数据加载器
-            target_recall: 目标召回率阈值（默认0.85）
+            target_recall: 目标召回率阈值（默认0.85，但不作为硬约束）
         
         Returns:
             dict: 包含最优阈值和对应的指标
@@ -1043,7 +1047,7 @@ class CrossDomainAudioTrainer:
         y_true_list = []
         
         print("\n" + "=" * 60)
-        print(f"扫描最优阈值（目标Recall≥{target_recall}）- 师兄建议的完整流程")
+        print("扫描最优阈值 - 师兄建议的完整流程（直接最大化Macro-F1）")
         print("=" * 60)
         
         # 收集所有验证集的logits和真实标签
@@ -1079,12 +1083,13 @@ class CrossDomainAudioTrainer:
             print("跳过先验logit平移")
         
         # 计算最终的概率（使用softmax）
-        probs = F.softmax(logits_final, dim=1)[:, 0]  # cough类的概率
+        # 师兄建议：确保 probs_cough 是 p(cough)
+        probs_cough = F.softmax(logits_final, dim=1)[:, 0]  # cough类的概率 (label=0)
         
         # ===== 步骤3: 可视化诊断（师兄建议: 排查清单）=====
         # 转换为numpy用于绘图
         y_true_np = y_true.cpu().numpy()
-        probs_np = probs.cpu().numpy()
+        probs_np = probs_cough.cpu().numpy()
         
         if getattr(self.args, 'plot_pr_curve', True):
             pr_curve_path = os.path.join(self.args.out, 'pr_curve_stage2.png')
@@ -1094,99 +1099,98 @@ class CrossDomainAudioTrainer:
             histogram_path = os.path.join(self.args.out, 'score_histogram_stage2.png')
             self.plot_score_histogram(y_true_np, probs_np, histogram_path)
         
-        # ===== 步骤4: 扫描最优阈值（目标Recall约束下的F2最优）=====
-        taus = torch.linspace(0, 1, 1001)
-        best = None
+        # ===== 步骤4: 扫描最优阈值（师兄建议：直接最大化 Macro-F1）=====
+        # 师兄参考实现：
+        # probs_cough = 1.0 - probs_nc
+        # thresholds = np.linspace(0.0, 1.0, 1001)
+        # best_t, best_macro_f1 = 0.5, -1
+        # for t in thresholds:
+        #     y_pred = (probs_cough >= t).astype(int)  # 以 cough 为正类
+        #     f1_cough = f1_score(y_true, y_pred, pos_label=1)
+        #     f1_nc    = f1_score(y_true, y_pred, pos_label=0)
+        #     macro_f1 = 0.5 * (f1_cough + f1_nc)
+        #     if macro_f1 > best_macro_f1:
+        #         best_macro_f1, best_t = macro_f1, t
         
-        for t in taus:
-            y_pred = (probs >= t).float()
-            
-            # 计算混淆矩阵元素
-            tp = ((y_pred == 1) & (y_true == 1)).sum().item()
-            fp = ((y_pred == 1) & (y_true == 0)).sum().item()
-            fn = ((y_pred == 0) & (y_true == 1)).sum().item()
-            tn = ((y_pred == 0) & (y_true == 0)).sum().item()
-            
-            # 计算指标
-            recall = tp / (tp + fn + 1e-9)
-            precision = tp / (tp + fp + 1e-9)
-            f1 = 2 * precision * recall / (precision + recall + 1e-9)
-            f2 = (5 * precision * recall) / (4 * precision + recall + 1e-9)  # Fβ, β=2
-            
-            # 只考虑满足召回率要求的阈值
-            if recall >= target_recall:
-                if best is None or f2 > best['f2']:
-                    best = {
-                        'tau': float(t),
-                        'recall': recall,
-                        'precision': precision,
-                        'f1': f1,
-                        'f2': f2,
-                        'tp': tp,
-                        'fp': fp,
-                        'fn': fn,
-                        'tn': tn,
-                        'temperature': temperature
-                    }
+        thresholds = np.linspace(0.0, 1.0, 1001)
+        best_t, best_macro_f1 = 0.5, -1
+        best_result = None
         
-        if best is None:
-            # 如果没有找到满足条件的阈值，返回召回率最高的阈值
-            print(f"⚠️  警告：未找到满足Recall≥{target_recall}的阈值，返回最高召回率的阈值")
-            print(f"   这说明模型对cough的打分整体偏低，严重欠校准！")
-            max_recall = 0
-            for t in taus:
-                y_pred = (probs >= t).float()
-                tp = ((y_pred == 1) & (y_true == 1)).sum().item()
-                fn = ((y_pred == 0) & (y_true == 1)).sum().item()
-                recall = tp / (tp + fn + 1e-9)
-                if recall > max_recall:
-                    max_recall = recall
-                    fp = ((y_pred == 1) & (y_true == 0)).sum().item()
-                    tn = ((y_pred == 0) & (y_true == 0)).sum().item()
-                    precision = tp / (tp + fp + 1e-9)
-                    f1 = 2 * precision * recall / (precision + recall + 1e-9)
-                    f2 = (5 * precision * recall) / (4 * precision + recall + 1e-9)
-                    best = {
-                        'tau': float(t),
-                        'recall': recall,
-                        'precision': precision,
-                        'f1': f1,
-                        'f2': f2,
-                        'tp': tp,
-                        'fp': fp,
-                        'fn': fn,
-                        'tn': tn,
-                        'temperature': temperature
-                    }
+        # 将tensor转为numpy用于计算
+        probs_cough_np = probs_cough.cpu().numpy()
+        y_true_np_int = y_true.cpu().numpy().astype(int)
+        
+        for t in thresholds:
+            # y_pred: 预测为 cough 的为1，预测为 non-cough 的为0
+            # 注意：这里 y_pred=1 表示预测为cough（与 probs_cough >= t 一致）
+            y_pred = (probs_cough_np >= t).astype(int)
+            
+            # 计算混淆矩阵（以 cough 为正类）
+            # y_true: 0=cough（正类）, 1=non-cough（负类）
+            # y_pred: 1=预测为cough, 0=预测为non-cough
+            # 因此需要反转 y_true: 将 label=0 映射为 1（正类），label=1 映射为 0（负类）
+            y_true_inverted = 1 - y_true_np_int  # 现在 1=cough, 0=non-cough
+            
+            tp = ((y_pred == 1) & (y_true_inverted == 1)).sum()  # 预测cough且真实cough
+            fp = ((y_pred == 1) & (y_true_inverted == 0)).sum()  # 预测cough但真实non-cough
+            fn = ((y_pred == 0) & (y_true_inverted == 1)).sum()  # 预测non-cough但真实cough
+            tn = ((y_pred == 0) & (y_true_inverted == 0)).sum()  # 预测non-cough且真实non-cough
+            
+            # 计算 F1 for cough（正类）
+            precision_cough = tp / (tp + fp + 1e-9)
+            recall_cough = tp / (tp + fn + 1e-9)
+            f1_cough = 2 * precision_cough * recall_cough / (precision_cough + recall_cough + 1e-9)
+            
+            # 计算 F1 for non-cough（负类）
+            precision_nc = tn / (tn + fn + 1e-9)
+            recall_nc = tn / (tn + fp + 1e-9)
+            f1_nc = 2 * precision_nc * recall_nc / (precision_nc + recall_nc + 1e-9)
+            
+            # Macro-F1
+            macro_f1 = 0.5 * (f1_cough + f1_nc)
+            
+            if macro_f1 > best_macro_f1:
+                best_macro_f1 = macro_f1
+                best_t = t
+                best_result = {
+                    'tau': float(t),
+                    'recall': recall_cough,
+                    'precision': precision_cough,
+                    'f1_cough': f1_cough,
+                    'f1_nc': f1_nc,
+                    'macro_f1': macro_f1,
+                    'tp': int(tp),
+                    'fp': int(fp),
+                    'fn': int(fn),
+                    'tn': int(tn),
+                    'temperature': temperature
+                }
         
         # 打印结果
         print("\n" + "=" * 60)
-        print("最优阈值扫描结果（已应用师兄建议的校准）:")
+        print("最优阈值扫描结果（师兄建议：直接最大化Macro-F1）:")
         print("=" * 60)
         print(f"温度参数 T: {temperature:.4f}")
-        print(f"最优阈值 τ: {best['tau']:.4f}")
-        print(f"召回率 (Recall): {best['recall']:.4f}")
-        print(f"精确率 (Precision): {best['precision']:.4f}")
-        print(f"F1 分数: {best['f1']:.4f}")
-        print(f"F2 分数: {best['f2']:.4f}")
-        print(f"混淆矩阵: TP={best['tp']}, FP={best['fp']}, FN={best['fn']}, TN={best['tn']}")
+        print(f"最优阈值 τ (for cough): {best_result['tau']:.4f}")
+        print(f"Macro-F1: {best_result['macro_f1']:.4f}")
+        print(f"  Cough    F1: {best_result['f1_cough']:.4f} | Precision: {best_result['precision']:.4f} | Recall: {best_result['recall']:.4f}")
+        print(f"  NonCough F1: {best_result['f1_nc']:.4f}")
+        print(f"混淆矩阵: TP={best_result['tp']}, FP={best_result['fp']}, FN={best_result['fn']}, TN={best_result['tn']}")
         print("=" * 60 + "\n")
         
         # 记录到日志
         self.logger("=" * 60, level=1)
-        self.logger("最优阈值扫描结果（已应用校准）", level=1)
+        self.logger("最优阈值扫描结果（师兄建议：直接最大化Macro-F1）", level=1)
         self.logger("=" * 60, level=1)
-        self.logger(f"目标召回率: {target_recall}", level=1)
         self.logger(f"温度参数 T: {temperature:.4f}", level=1)
-        self.logger(f"最优阈值 τ: {best['tau']:.4f}", level=1)
-        self.logger(f"召回率 (Recall): {best['recall']:.4f}", level=1)
-        self.logger(f"精确率 (Precision): {best['precision']:.4f}", level=1)
-        self.logger(f"F1 分数: {best['f1']:.4f}", level=1)
-        self.logger(f"F2 分数: {best['f2']:.4f}", level=1)
-        self.logger(f"混淆矩阵: TP={best['tp']}, FP={best['fp']}, FN={best['fn']}, TN={best['tn']}", level=1)
+        self.logger(f"最优阈值 τ (for cough): {best_result['tau']:.4f}", level=1)
+        self.logger(f"Macro-F1: {best_result['macro_f1']:.4f}", level=1)
+        self.logger(f"  Cough    F1: {best_result['f1_cough']:.4f} | Precision: {best_result['precision']:.4f} | Recall: {best_result['recall']:.4f}", level=1)
+        self.logger(f"  NonCough F1: {best_result['f1_nc']:.4f}", level=1)
+        self.logger(f"混淆矩阵: TP={best_result['tp']}, FP={best_result['fp']}, FN={best_result['fn']}, TN={best_result['tn']}", level=1)
         self.logger("=" * 60, level=1)
         
-        return best
+        return best_result
 
     def run_full_training(self):
         print("Starting Cross-Domain Audio Long-Tail Training")

@@ -16,7 +16,7 @@ def parse_args():
     # --- 数据集和路径 ---
     parser.add_argument('--data_dir', default='data/', help='Root directory of datasets')
     parser.add_argument('--source_domain', default='cold_zone', help='Folder name of the source domain dataset')
-    parser.add_argument('--target_domain', default='hot_zone_fine', help='Folder name of the target domain dataset')
+    parser.add_argument('--target_domain', default='hot_13.31', help='Folder name of the target domain dataset')
     parser.add_argument('--out', default='output', help='Directory to output the results')
 
     # --- 模型和任务 ---
@@ -71,9 +71,9 @@ def parse_args():
     parser.add_argument('--teacher_ema_warmup', type=int, default=5,
                         help='Number of epochs to wait before starting teacher EMA updates (default: 5)')
     parser.add_argument('--distill_weight_high', type=float, default=0.5,
-                        help='High distillation weight during warm-up period (师兄建议: 0.5, 原1.0会固化Stage1的负向偏置)')
+                        help='High distillation weight during warm-up period')
     parser.add_argument('--distill_weight_low', type=float, default=0.1,
-                        help='Low distillation weight after warm-up period (师兄建议: 0.1, 原0.3仍过高)')
+                        help='Low distillation weight after warm-up period')
     
     # --- KD权重余弦衰减参数 ---
     parser.add_argument('--use_kd_cosine_decay', action='store_true', default=False,
