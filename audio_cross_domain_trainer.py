@@ -269,16 +269,13 @@ class CrossDomainAudioTrainer:
                 self.med_best = test_cls[1] if len(test_cls) > 1 else 0
                 self.few_best = test_cls[2] if len(test_cls) > 2 else 0
                 self.best_model = copy.deepcopy(self.model.state_dict())
+                self.patience_counter = 0  # 重置早停计数器（基于macro F1改进）
+            else:
+                self.patience_counter += 1
             
             self._log_epoch_results(epoch + 1, self.args.epochs, 
                                   train_loss, train_acc, test_loss, test_acc, 
                                   test_cls, lr, "Stage1", micro_f1, macro_f1, class_metrics)
-            
-            if test_loss < self.best_val_loss:
-                self.best_val_loss = test_loss
-                self.patience_counter = 0
-            else:
-                self.patience_counter += 1
             
             if self.patience_counter >= self.early_stopping_patience:
                 self.logger(f'Early stopping triggered after {epoch + 1} epochs.', level=1)
@@ -518,6 +515,7 @@ class CrossDomainAudioTrainer:
         Stage 2 单个 epoch 的训练
         - 默认：仅使用目标域数据（无标签自我学习）
         - 可选：同时使用源域数据（有标签监督学习）+ 目标域数据
+        - 支持半监督学习：根据 label_ratio 部分使用 ground-truth labels
         """
         self.model.train()
         
@@ -530,6 +528,9 @@ class CrossDomainAudioTrainer:
         correct = 0
         total = 0
         
+        # 读取 label_ratio 参数
+        label_ratio = getattr(self.args, 'label_ratio', 0.0)
+        
         pbar = tqdm(target_loader, desc=f'Stage 2 Training (Target Only)', leave=False)
 
         # 主要训练循环
@@ -539,6 +540,20 @@ class CrossDomainAudioTrainer:
             x_target_weak = x_target_weak.to(self.device)
             waveforms = waveforms.to(self.device)
             labels = labels.to(self.device)
+            
+            # 构建 labeled_mask：决定哪些样本使用 ground-truth labels
+            batch_size = labels.size(0)
+            
+            if label_ratio > 0:
+                num_labeled = int(label_ratio * batch_size)
+                if num_labeled > 0:
+                    perm = torch.randperm(batch_size, device=self.device)
+                    labeled_mask = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+                    labeled_mask[perm[:num_labeled]] = True
+                else:
+                    labeled_mask = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+            else:
+                labeled_mask = None  # 纯无监督模式
             
             # 对原始波形应用强增强生成 x_target_strong
             x_target_strong = []
@@ -579,7 +594,8 @@ class CrossDomainAudioTrainer:
 
             # --- Compute Stage 2 Loss ---
             total_loss, loss_ce, distill_loss = self.model.compute_stage2_loss(
-                student_scores, teacher_scores, pseudo_labels, max_conf, is_weak=False
+                student_scores, teacher_scores, pseudo_labels, max_conf, is_weak=False,
+                true_labels=labels, labeled_mask=labeled_mask
             )
 
             loss = total_loss
@@ -589,10 +605,10 @@ class CrossDomainAudioTrainer:
             # 注意：batch级EMA更新已移除(师兄建议)
             # EMA Teacher 只在epoch级按warm-up规则更新 (见train_stage2方法)
 
-            # 计算准确率（使用伪标签）
+            # 计算准确率（使用真实标签，以获得更有意义的指标）
             _, predicted = torch.max(student_scores, 1)
-            total += pseudo_labels.size(0)
-            correct += (predicted == pseudo_labels).sum().item()
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
 
             # 记录损失
             total_losses.append(total_loss.item())
@@ -806,6 +822,26 @@ class CrossDomainAudioTrainer:
             self.logger(f'[Stats]\tMany:\t{test_cls[0]:.4f}\tMedium:\t{test_cls[1]:.4f}\tFew:\t{test_cls[2]:.4f}', level=2)
         self.logger(f'[Param]\tLR:\t{lr:.8f}', level=2)
         
+        # Log to CSV
+        csv_metrics = {
+            'stage': stage,
+            'epoch': epoch,
+            'train_loss': f'{train_loss:.6f}',
+            'train_acc': f'{train_acc:.6f}',
+            'test_loss': f'{test_loss:.6f}',
+            'test_acc': f'{test_acc:.6f}',
+            'micro_f1': f'{micro_f1:.6f}',
+            'macro_f1': f'{macro_f1:.6f}',
+            'cough_f1': f'{class_metrics["cough_f1"]:.6f}',
+            'cough_precision': f'{class_metrics["cough_precision"]:.6f}',
+            'cough_recall': f'{class_metrics["cough_recall"]:.6f}',
+            'non_cough_f1': f'{class_metrics["non_cough_f1"]:.6f}',
+            'non_cough_precision': f'{class_metrics["non_cough_precision"]:.6f}',
+            'non_cough_recall': f'{class_metrics["non_cough_recall"]:.6f}',
+            'learning_rate': f'{lr:.8f}'
+        }
+        self.logger.log_metrics_csv(csv_metrics)
+        
     def _log_stage2_epoch(self, epoch, train_results, test_loss, test_acc, test_cls, lr, micro_f1, macro_f1, class_metrics):
         """记录Stage 2 epoch结果"""
         self.logger(f'Stage2 - Epoch: [{epoch} | {self.args.finetune_epoch}]', level=1)
@@ -825,6 +861,31 @@ class CrossDomainAudioTrainer:
         if len(test_cls) >= 3:
             self.logger(f'[Stats]\tMany:\t{test_cls[0]:.4f}\tMedium:\t{test_cls[1]:.4f}\tFew:\t{test_cls[2]:.4f}', level=2)
         self.logger(f'[Param]\tLR:\t{lr:.8f}', level=2)
+        
+        # Log to CSV
+        csv_metrics = {
+            'stage': 'Stage2',
+            'epoch': epoch,
+            'train_loss': f'{train_results["total_loss"]:.6f}',
+            'train_acc': f'{train_results["train_acc"]:.6f}',
+            'test_loss': f'{test_loss:.6f}',
+            'test_acc': f'{test_acc:.6f}',
+            'micro_f1': f'{micro_f1:.6f}',
+            'macro_f1': f'{macro_f1:.6f}',
+            'cough_f1': f'{class_metrics["cough_f1"]:.6f}',
+            'cough_precision': f'{class_metrics["cough_precision"]:.6f}',
+            'cough_recall': f'{class_metrics["cough_recall"]:.6f}',
+            'non_cough_f1': f'{class_metrics["non_cough_f1"]:.6f}',
+            'non_cough_precision': f'{class_metrics["non_cough_precision"]:.6f}',
+            'non_cough_recall': f'{class_metrics["non_cough_recall"]:.6f}',
+            'learning_rate': f'{lr:.8f}'
+        }
+        
+        # 如果使用源域数据，添加源域损失
+        if self.args.use_source_in_stage2:
+            csv_metrics['train_source_loss'] = f'{train_results["source_loss"]:.6f}'
+        
+        self.logger.log_metrics_csv(csv_metrics)
     
     def _save_model(self, filename):
         if self.best_model is not None:

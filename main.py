@@ -38,11 +38,11 @@ def parse_args():
     parser.add_argument('--epochs', default=100, type=int, help='Number of total epochs for stage 1')
     parser.add_argument('--lr', '--learning-rate', default=0.0001, type=float, help='Initial learning rate for stage 1')
     parser.add_argument('--wd', default=1e-3, type=float, help='Weight decay for stage 1 optimizer')
-    parser.add_argument('--early_stopping_patience', default=20, type=int, 
+    parser.add_argument('--early_stopping_patience', default=10, type=int, 
                         help='Patience for early stopping in stage 1. Set to 0 to disable.')
 
     # --- Stage 2: 分类器微调和蒸馏参数 (源域+目标域) ---
-    parser.add_argument('--finetune_epoch', default=30, type=int, help='Number of total epochs for stage 2')
+    parser.add_argument('--finetune_epoch', default=25, type=int, help='Number of total epochs for stage 2')
     parser.add_argument('--finetune_lr', default=3e-5, type=float, 
                         help='Learning rate for stage 2 (师兄建议: 3e-5, 原1e-5太小导致无法充分自适应)')
     parser.add_argument('--finetune_wd', default=1e-4, type=float, help='Weight decay for stage 2 optimizer')
@@ -116,7 +116,7 @@ def parse_args():
     parser.add_argument('--hop_size', type=float, default=0.32, help='Sliding window hop size in seconds for testing')
 
     # --- 训练设置 ---
-    parser.add_argument('--batch_size', default=16, type=int, help='Train batchsize')
+    parser.add_argument('--batch_size', default=32, type=int, help='Train batchsize')
     parser.add_argument('--test_batch_size', default=1, type=int, help='Test batchsize, must be 1 for sliding window')
     parser.add_argument('--workers', type=int, default=4, help='Number of data loading workers')
     parser.add_argument('--seed', type=str, default='42', help='Manual seed')
@@ -175,6 +175,10 @@ def parse_args():
                         help='Use source domain data in stage 2 (in addition to target domain data)')
     parser.add_argument('--source_target_ratio', type=float, default=1.0,
                         help='Ratio of source to target batches in stage 2 when use_source_in_stage2 is enabled')
+    
+    # --- Stage 2 半监督学习参数 ---
+    parser.add_argument('--label_ratio', type=float, default=0.0,
+                        help='Ratio of target domain samples in Stage 2 that use ground-truth labels (0.0 = unsupervised, 1.0 = fully supervised on target).')
     
     # --- Stage 2 滑动窗口筛选参数 ---
     parser.add_argument('--use_sliding_window_filter', action='store_true', default=False,
@@ -256,6 +260,10 @@ def parse_args():
     if args.use_source_in_stage2:
         ablation_suffix += f"_S2Src{args.source_target_ratio}"
     
+    # 添加 Stage 2 label_ratio 标识
+    if args.label_ratio > 0:
+        ablation_suffix += f"_S2Label{args.label_ratio}"
+    
     args.out = os.path.join(args.out, f'{args.source_domain}_to_{args.target_domain}{ablation_suffix}_{time_str}')
 
     if args.gpu:
@@ -313,6 +321,7 @@ def main():
     print(f"KD Negative Margin: {args.kd_neg_margin} (师兄建议: margin约束)")
     print(f"Label Smoothing (Stage 2): {'DISABLED (师兄建议)' if args.disable_label_smoothing_stage2 else 'ENABLED'}")
     print(f"BCE pos_weight: {'ENABLED (weight=' + str(args.bce_pos_weight) + ')' if args.use_bce_pos_weight else 'DISABLED'}")
+    print(f"Label Ratio (Stage 2 Target Supervision): {args.label_ratio}")
     
     print(f"\n[概率校准和阈值 - 师兄建议优先级A]")
     print(f"Temperature Scaling: {'ENABLED (师兄建议: 优先级A-1)' if args.apply_temperature_scaling else 'DISABLED'}")

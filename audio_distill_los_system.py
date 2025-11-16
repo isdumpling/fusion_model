@@ -165,6 +165,10 @@ class AudioDistillLOSSystem(nn.Module):
             temp_smooth = self.hparams.label_smooth
             self.hparams.label_smooth = 0.0
             self.loss_function = create_loss_function(self.hparams, self.class_counts)
+            # 将损失函数移动到模型所在的设备（修复 Logit Adjustment 的设备不匹配问题）
+            if hasattr(self.loss_function, 'to'):
+                device = next(self.parameters()).device
+                self.loss_function = self.loss_function.to(device)
             self.hparams.label_smooth = temp_smooth  # 恢复原始值，仅供记录
             
             print(f"Stage 2: Label Smoothing 已关闭 (从 {original_smooth} 改为 0.0)")
@@ -179,7 +183,8 @@ class AudioDistillLOSSystem(nn.Module):
         else:
             return self.feature_extractor  # 返回学生模型的特征提取器
 
-    def compute_stage2_loss(self, student_scores, teacher_scores, pseudo_labels, max_conf, is_weak):
+    def compute_stage2_loss(self, student_scores, teacher_scores, pseudo_labels, max_conf, is_weak,
+                           true_labels=None, labeled_mask=None):
         """
         Computes the loss for Stage 2 using category-aware thresholds for pseudo-labels
         and distillation on high-confidence negative samples with margin constraint.
@@ -187,39 +192,77 @@ class AudioDistillLOSSystem(nn.Module):
         师兄建议的改进：
         1. 负类阈值提高到0.85（从0.7）
         2. KD仅在"高置信度+高margin"的负类上计算
+        
+        半监督学习扩展：
+        3. 支持 true_labels 和 labeled_mask，允许部分样本使用 ground-truth labels
+        4. labeled samples 的 CE 使用真实标签，unlabeled samples 的 CE 使用伪标签
+        5. KD 仅应用于 unlabeled 高置信度负样本
+        
+        Args:
+            student_scores: 学生模型输出 (N, num_classes)
+            teacher_scores: 教师模型输出 (N, num_classes)
+            pseudo_labels: 教师模型生成的伪标签 (N,)
+            max_conf: 教师模型的最大置信度 (N,)
+            is_weak: 是否是弱增强
+            true_labels: 真实标签 (N,), 可选
+            labeled_mask: 指示哪些样本使用真实标签的布尔掩码 (N,), 可选
         """
-        # --- 1. Category-Aware Pseudo-Label Masking ---
+        # --- 1. 构建 effective_labels 和 effective_conf ---
+        # 默认从伪标签和置信度开始
+        effective_labels = pseudo_labels
+        effective_conf = max_conf
+        
+        if (true_labels is not None) and (labeled_mask is not None):
+            # 克隆以避免原地修改问题
+            effective_labels = pseudo_labels.clone()
+            effective_conf = max_conf.clone()
+            
+            # 对于 labeled_mask 选中的样本，使用 ground-truth labels
+            effective_labels[labeled_mask] = true_labels[labeled_mask]
+            
+            # labeled 样本总是通过置信度阈值检查（设为1.0）
+            effective_conf[labeled_mask] = 1.0
+        
+        # --- 2. Category-Aware Pseudo-Label Masking ---
         tau_pos = getattr(self.hparams, 'stage2_ce_conf_thresh_pos', 0.3)
         tau_neg = getattr(self.hparams, 'stage2_ce_conf_thresh_neg', 0.85)  # 从0.7提高到0.85 (师兄建议)
 
         # Assuming 0 is the positive class (cough), 1 is negative class (non-cough)
-        pos_class_mask = (pseudo_labels == 0)
+        pos_class_mask = (effective_labels == 0)
         neg_class_mask = ~pos_class_mask
 
-        mask_pos = pos_class_mask & (max_conf >= tau_pos)
-        mask_neg = neg_class_mask & (max_conf >= tau_neg)
+        mask_pos = pos_class_mask & (effective_conf >= tau_pos)
+        mask_neg = neg_class_mask & (effective_conf >= tau_neg)
         
         # Combined mask for Cross-Entropy loss
         ce_mask = mask_pos | mask_neg
 
-        # --- 2. Supervised Cross-Entropy on Masked Pseudo-Labels ---
+        # --- 3. Supervised Cross-Entropy on Effective Labels ---
         if ce_mask.any():
-            loss_ce = self.loss_function(student_scores[ce_mask], pseudo_labels[ce_mask])
+            loss_ce = self.loss_function(student_scores[ce_mask], effective_labels[ce_mask])
         else:
             loss_ce = torch.zeros((), device=student_scores.device)
 
-        # --- 3. Distillation Loss on High-Confidence + High-Margin NEGATIVE Samples ---
+        # --- 4. Distillation Loss on Unlabeled High-Confidence + High-Margin NEGATIVE Samples ---
         distill_loss = torch.zeros((), device=student_scores.device)
         dw = getattr(self.hparams, 'distill_weight', 0.0)
 
-        # Only compute distillation if weight is positive and there are high-confidence negative samples
-        if dw > 0 and mask_neg.any():
+        # 构建 KD base mask: 仅在 unlabeled 高置信度负样本上应用 KD
+        kd_base_mask = mask_neg
+        
+        if labeled_mask is not None:
+            # 只对 unlabeled 负样本应用 KD
+            unlabeled_mask = ~labeled_mask
+            kd_base_mask = mask_neg & unlabeled_mask
+        
+        # Only compute distillation if weight is positive and there are eligible samples
+        if dw > 0 and kd_base_mask.any():
             T = getattr(self.hparams, 'distill_temperature', 4.0)
             kd_neg_margin = getattr(self.hparams, 'kd_neg_margin', 0.20)  # 新增：KD负类margin约束 (师兄建议)
             
             with torch.no_grad():
-                # 计算teacher在负类样本上的概率分布
-                t_probs = F.softmax(teacher_scores[mask_neg] / T, dim=-1)
+                # 计算teacher在符合条件的负类样本上的概率分布
+                t_probs = F.softmax(teacher_scores[kd_base_mask] / T, dim=-1)
                 # 计算margin: P(non-cough) - P(cough)
                 # 假设类别1是non-cough, 类别0是cough
                 margin = t_probs[:, 1] - t_probs[:, 0]
@@ -228,10 +271,10 @@ class AudioDistillLOSSystem(nn.Module):
             
             # 如果有满足margin条件的样本，才计算KD loss
             if kd_mask.any():
-                student_log_probs = F.log_softmax(student_scores[mask_neg][kd_mask] / T, dim=-1)
+                student_log_probs = F.log_softmax(student_scores[kd_base_mask][kd_mask] / T, dim=-1)
                 
                 with torch.no_grad():
-                    teacher_soft = F.softmax(teacher_scores[mask_neg][kd_mask] / T, dim=-1)
+                    teacher_soft = F.softmax(teacher_scores[kd_base_mask][kd_mask] / T, dim=-1)
                 
                 distill_loss = F.kl_div(student_log_probs, teacher_soft.detach(), reduction='batchmean') * (T * T)
 
